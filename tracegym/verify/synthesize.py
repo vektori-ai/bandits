@@ -18,6 +18,12 @@ table scores full marks. Collateral damage has to cost something or the policy
 learns it is free. So every entity and every row we have pre-state evidence for,
 and which the trace did not change, gets an explicit STATE_UNCHANGED.
 
+One asymmetry is deliberate too. A *partial* pre-state row - one production
+named in an id list but never read - still gets assertions, but only over the
+fields that are actually known (its key and the query filters that produced it).
+Existence and those fields are evidence; the rest of the row is not, and is never
+asserted to be empty. See :func:`partial_key_ids`.
+
 Two refusals are deliberate:
 
 * **Only positively-labeled traces.** "Do what production did" is not a reward
@@ -50,9 +56,19 @@ from tracegym.task.prestate import iter_objects, key_of, reconstruct_final_state
 __all__ = [
     "UnlabeledTraceError",
     "external_tools_of",
+    "partial_key_ids",
     "row_key_for",
     "synthesize_verifier",
 ]
+
+
+#: Appended to the description of any assertion built over a partial pre-state
+#: row, so the reviewer can see that the row's unlisted columns are *unknown*
+#: rather than known-empty, and that the assertion is deliberately narrow.
+_PARTIAL_NOTE = (
+    " (partial pre-state row: production named this row in an id list but never "
+    "read it, so only the fields listed here are known)"
+)
 
 
 class UnlabeledTraceError(ValueError):
@@ -82,6 +98,25 @@ def external_tools_of(schema: StateSchema, trace: Trace) -> list[str]:
         if inv.tool not in known and inv.tool not in seen:
             seen.append(inv.tool)
     return seen
+
+
+def partial_key_ids(task: TaskCase, entity: str) -> set[str]:
+    """Key ids of ``entity``'s partial pre-state rows, from the task provenance.
+
+    A partial row is one production only *named* - an id in a list - so its key
+    and the query filters that produced it are known and nothing else is (see
+    :mod:`tracegym.task.prestate`). Synthesis still asserts on it, because
+    existence and those known fields are real evidence and an agent that deletes
+    or rewrites the row is doing collateral damage. What it must NOT do is treat
+    the row's *unknown* columns as absent: every assertion below is written only
+    over fields the pre-state row actually carries, so a partial row yields a
+    narrower assertion rather than a wrong one. The description says so out loud,
+    because a human reads these before they are allowed to grade.
+    """
+    raw = task.provenance.get("partial_pre_state_rows") or {}
+    if not isinstance(raw, dict):
+        return set()
+    return {json.dumps(k, sort_keys=True, default=str) for k in raw.get(entity, ())}
 
 
 def _index(rows: Iterable[JsonObject], pk: str | None) -> dict[str, JsonObject]:
@@ -154,6 +189,7 @@ def synthesize_verifier(
         pre_er: EntityRows | None = pre_by_entity.get(entity.name)
         pre_idx = _index(pre_er.rows, pk) if pre_er else {}
         post_idx = final.get(entity.name, {})
+        partial_ids = partial_key_ids(task, entity.name)
 
         if entity.static_snapshot:
             # Read-only, never cross-referenced. We refuse to invent structure
@@ -217,6 +253,7 @@ def synthesize_verifier(
                             description=(
                                 f"the other fields of {entity.name}[{key_value!r}] must be "
                                 f"untouched: {sorted(same)}"
+                                + (_PARTIAL_NOTE if key_id in partial_ids else "")
                             ),
                         )
                     )
@@ -249,6 +286,7 @@ def synthesize_verifier(
                         description=(
                             f"{entity.name}[{key_value!r}] was never written and must be "
                             f"unchanged"
+                            + (_PARTIAL_NOTE if key_id in partial_ids else "")
                         ),
                     )
                 )
@@ -264,6 +302,11 @@ def synthesize_verifier(
                     description=(
                         f"the {entity.name} entity must be untouched; the reference episode "
                         f"changed nothing in it"
+                        + (
+                            _PARTIAL_NOTE
+                            if partial_ids & set(pre_idx)
+                            else ""
+                        )
                     ),
                 )
             )

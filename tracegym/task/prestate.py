@@ -24,6 +24,36 @@ a dirty set of ``(entity, row_key)`` pairs, and only reads that touch a dirty ro
 When a write's target row cannot be identified - no primary key in its arguments
 or response - we mark the *whole entity* dirty from that step onward. Being
 conservative there costs seed rows; being permissive there corrupts the task.
+
+Two kinds of row escape the "observe a keyed body" happy path, and both are
+handled here:
+
+**Static-snapshot entities.** ``EntitySchema.static_snapshot`` entities have
+``primary_key is None`` by definition - being un-cross-referenced is what makes
+them a snapshot. Requiring a key to attribute a body would make the feature
+unreachable at runtime, so static rows are attributed by *content* instead:
+identical bodies are one row, different bodies are different rows. A static
+snapshot is by definition never written, so every observation of one is valid
+pre-state and the pre/post-write discipline below can never reject it.
+
+**Partial rows.** A response can *name* a row without showing it:
+``search_orders(customer_id=88) -> {"order_ids": [7741, 7742]}`` proves order
+7742 exists, and proves nothing about its contents. Dropping it loses fidelity -
+the replayed search returns one id where production returned two - so we seed a
+*partial* row carrying only what production actually told us: the primary key,
+plus any query argument that names a declared column of the entity (an equality
+filter the returned rows must satisfy: ``customer_id=88`` came from the search
+arguments, not from a guess).
+
+A partial row must never be mistaken for an observed one, and ``EntityRows`` has
+no flag for it, so the distinction is recorded out of band, in
+``TaskCase.provenance["partial_pre_state_rows"]``: ``{entity: [key, ...]}``. The
+invariant is that every key listed there addresses a row in ``pre_state`` whose
+non-key fields are unknown, not merely unset. A later full read of the same row
+upgrades it - the key is dropped from the partial list the moment an observed
+body for it arrives. Downstream consumers that care about the difference (see
+:mod:`tracegym.verify.synthesize`) read that list; consumers that only need "this
+row existed at the start" can ignore it.
 """
 
 from __future__ import annotations
@@ -49,7 +79,11 @@ __all__ = [
     "PreState",
     "RowRef",
     "attribute_object",
+    "content_key",
     "entity_field_names",
+    "id_list_fields",
+    "id_list_rows",
+    "implied_columns",
     "iter_objects",
     "key_of",
     "reconstruct_final_state",
@@ -79,6 +113,9 @@ class RowRef:
     row: JsonObject
     step: int
     tool: str
+    partial: bool = False
+    """True when production only *named* this row (an id in a list) and never
+    showed its body. ``row`` then holds the key and query-implied columns only."""
 
     @property
     def key_id(self) -> str:
@@ -105,18 +142,74 @@ def iter_objects(value: JsonValue) -> Iterator[JsonObject]:
             yield from iter_objects(v)
 
 
+def content_key(obj: JsonObject) -> str:
+    """The identity of a keyless (static-snapshot) row: its own canonical body.
+
+    Static snapshots have no primary key to address rows by, so content *is* the
+    key. Two observations of the same body are one row; two different bodies are
+    two rows. Canonical JSON (sorted keys, no whitespace slack) makes that
+    comparison independent of the order the exporter happened to serialize in.
+    """
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _attribute_static(obj: JsonObject, schema: StateSchema) -> tuple[str, JsonValue] | None:
+    """Attribute a keyless body to a static-snapshot entity, by content.
+
+    ``EntitySchema.static_snapshot`` entities have ``primary_key is None`` by
+    definition: never being cross-referenced is exactly what makes them a
+    snapshot. So the keyed path above can never match one, and without this the
+    static-snapshot feature would exist in the schema and be unreachable at
+    runtime - every environment would start with an empty table and the
+    reimplemented reader would return nothing where production returned a body.
+
+    The admission rule is containment, not overlap: every key of the object must
+    be a declared field of the entity, and at least one must be present. That is
+    strict enough that ``{"order_id": 7741, "status": "delivered"}`` can never be
+    mistaken for a one-column ``store_policy`` row, and loose enough that the
+    single-field bodies these entities almost always have still land.
+
+    A static snapshot is by definition never written, so *every* observation of
+    one is valid pre-state; the pre/post-write discipline in
+    :func:`reconstruct_pre_state` still runs over it and simply never fires.
+
+    Misses: a static entity whose schema declared no fields at all (nothing to
+    contain against, so nothing is admitted), and two genuinely distinct rows
+    that happen to serialize identically - they collapse into one.
+    """
+    best: tuple[int, str, JsonValue] | None = None
+    for entity in schema.entities:
+        if not entity.static_snapshot:
+            continue
+        names = entity_field_names(entity)
+        if not names or not obj:
+            continue
+        if not set(obj) <= names:
+            continue
+        cand = (len(obj), entity.name, content_key(obj))
+        if best is None or (-cand[0], cand[1]) < (-best[0], best[1]):
+            best = cand
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
 def attribute_object(obj: JsonObject, schema: StateSchema) -> tuple[str, JsonValue] | None:
     """Decide which entity an object is a row of, and what its key is.
 
-    Returns ``(entity_name, primary_key_value)`` or None when the object is not
-    recognisably a row. Requires the entity's primary key to be present and at
-    least :data:`MIN_FIELD_OVERLAP` declared fields to match. Ties are broken by
-    entity name so the result is deterministic.
+    Returns ``(entity_name, key)`` or None when the object is not recognisably a
+    row. For a keyed entity the key is the primary key value: the entity's
+    primary key must be present and at least :data:`MIN_FIELD_OVERLAP` declared
+    fields must match. For a ``static_snapshot`` entity there is no primary key
+    to require, so the key is the row's canonical content (see
+    :func:`_attribute_static`). Ties are broken by entity name so the result is
+    deterministic, and keyed entities always win over static ones.
 
-    Catches: rows in envelopes, rows in lists, write-response rows.
-    Misses: entities with no inferred primary key (they are skipped entirely -
-    we cannot address their rows, so we cannot assert on them either), and rows
-    whose response uses field names the schema never saw.
+    Catches: rows in envelopes, rows in lists, write-response rows, and keyless
+    static-snapshot bodies.
+    Misses: non-static entities with no inferred primary key (they are skipped
+    entirely - we cannot address their rows, so we cannot assert on them
+    either), and rows whose response uses field names the schema never saw.
     """
     if not isinstance(obj, dict):
         return None
@@ -135,9 +228,9 @@ def attribute_object(obj: JsonObject, schema: StateSchema) -> tuple[str, JsonVal
         cand = (overlap, entity.name, obj[pk])
         if best is None or (-cand[0], cand[1]) < (-best[0], best[1]):
             best = cand
-    if best is None:
-        return None
-    return best[1], best[2]
+    if best is not None:
+        return best[1], best[2]
+    return _attribute_static(obj, schema)
 
 
 def _project(entity: EntitySchema, obj: JsonObject) -> JsonObject:
@@ -183,6 +276,104 @@ def key_of(entity: EntitySchema, obj: JsonObject) -> JsonValue | None:
 
 
 # --------------------------------------------------------------------------
+# partial rows: entities production NAMED but never showed
+# --------------------------------------------------------------------------
+
+
+def id_list_fields(entity: EntitySchema) -> set[str]:
+    """Response field names that would hold a list of this entity's ids.
+
+    Derived from the primary key rather than from English: ``order_id`` implies
+    ``order_ids``, which is the shape :mod:`tracegym.env.tools` already emits for
+    a list-form read. Kept to a small closed set on purpose - a looser rule would
+    start reading arbitrary integer arrays as row ids.
+    """
+    pk = entity.primary_key
+    if not pk:
+        return set()
+    names = {f"{pk}s", "ids", f"{entity.name}_ids"}
+    if pk.endswith("_id"):
+        names.add(f"{pk[:-3]}_ids")
+    return names
+
+
+def implied_columns(entity: EntitySchema, arguments: JsonObject) -> JsonObject:
+    """Columns a query's own arguments prove about every row it returned.
+
+    ``search_orders(customer_id=88)`` returned these ids *because* they match
+    ``customer_id == 88``; that is a fact production stated, not an inference
+    about contents. So an argument whose name is a declared column of the entity
+    (and is a scalar, and is not the primary key itself) is carried onto the
+    partial row.
+
+    Misses / over-reaches: an argument that names a column but is not an equality
+    filter - a ``status`` argument meaning "sort by status", or a range bound
+    that happens to share a column name - would be copied verbatim. Foreign keys
+    are the overwhelmingly common case and are safe; anything else is why the row
+    stays marked partial and why a reviewer sees it.
+    """
+    pk = entity.primary_key
+    names = entity_field_names(entity)
+    out: JsonObject = {}
+    if not isinstance(arguments, dict):
+        return out
+    for name, value in arguments.items():
+        if name == pk or name not in names:
+            continue
+        if isinstance(value, (dict, list, tuple)):
+            continue
+        out[name] = value
+    return out
+
+
+def id_list_rows(inv: InvocationPoint, schema: StateSchema) -> list[RowRef]:
+    """Rows this invocation only NAMED, as partial rows.
+
+    A row we know exists but have never read is a genuine epistemic middle
+    ground. Dropping it costs fidelity that shows up immediately: the replayed
+    ``search_orders`` returns one id where production returned two, which reads
+    as a broken environment. Inventing its contents would be worse. So we seed
+    exactly what production told us - the id, plus the query's own equality
+    filters (:func:`implied_columns`) - and flag the row partial so that nothing
+    downstream mistakes "this row exists" for "we know what is in it".
+
+    Only a tool the schema already lists in the entity's ``read_by`` is trusted
+    to be naming that entity's ids; a bare integer array from an unrelated tool
+    is left alone.
+    """
+    out: list[RowRef] = []
+    for entity in schema.entities:
+        pk = entity.primary_key
+        if not pk or entity.static_snapshot or inv.tool not in entity.read_by:
+            continue
+        wanted = id_list_fields(entity)
+        if not wanted:
+            continue
+        implied = implied_columns(entity, inv.arguments)
+        for obj in iter_objects(inv.response):
+            if "error" in obj:
+                continue
+            for name, value in obj.items():
+                if name not in wanted or not isinstance(value, (list, tuple)):
+                    continue
+                for item in value:
+                    if item is None or isinstance(item, (dict, list, tuple)):
+                        # A list of full rows is not an id list; rows_in has it.
+                        continue
+                    out.append(
+                        RowRef(
+                            entity=entity.name,
+                            key=item,
+                            row={pk: item, **implied},
+                            step=inv.step,
+                            tool=inv.tool,
+                            partial=True,
+                        )
+                    )
+    return out
+
+
+# --------------------------------------------------------------------------
 # tool classes
 # --------------------------------------------------------------------------
 
@@ -212,6 +403,14 @@ class PreState:
     keys: dict[str, dict[str, JsonValue]] = field(default_factory=dict)
     """entity -> key_id -> the raw primary key value."""
 
+    partial: dict[str, dict[str, JsonValue]] = field(default_factory=dict)
+    """entity -> key_id -> key, for rows production NAMED but never showed.
+
+    A row listed here IS in :attr:`rows`, and its non-key fields are unknown
+    rather than absent. Surfaces as ``provenance["partial_pre_state_rows"]``.
+    A key leaves this set the instant an observed body for it arrives.
+    """
+
     first_write_step: int | None = None
     blocked: list[JsonObject] = field(default_factory=list)
     """Observations rejected as post-state. The audit trail for the leak rule."""
@@ -223,16 +422,28 @@ class PreState:
 
     def add(self, ref: RowRef) -> bool:
         bucket = self.rows.setdefault(ref.entity, {})
+        partials = self.partial.setdefault(ref.entity, {})
         if ref.key_id in bucket:
             # First observation wins. A later pre-write read of the same row can
             # only add fields, never overwrite - the earlier value is closer to
             # the true start of the episode.
             for k, v in ref.row.items():
                 bucket[ref.key_id].setdefault(k, v)
+            if not ref.partial:
+                # An observed body supersedes a partial seed: we now know the
+                # contents, so the row stops being partial. Order does not
+                # matter - the id-list may come before or after the read.
+                partials.pop(ref.key_id, None)
             return False
         bucket[ref.key_id] = dict(ref.row)
         self.keys.setdefault(ref.entity, {})[ref.key_id] = ref.key
+        if ref.partial:
+            partials[ref.key_id] = ref.key
         return True
+
+    def partial_row_keys(self) -> dict[str, list[JsonValue]]:
+        """entity -> the keys of its partial rows. The provenance payload."""
+        return {name: list(keys.values()) for name, keys in self.partial.items() if keys}
 
     def has_value(self, value: Any) -> bool:
         """True when some pre-state row carries this value in any field."""
@@ -358,7 +569,7 @@ def reconstruct_pre_state(
         if not is_write:
             if inv.status is CallStatus.ERROR and not include_error_responses:
                 continue
-            for ref in rows_in(inv, schema):
+            for ref in (*rows_in(inv, schema), *id_list_rows(inv, schema)):
                 if dirty.is_dirty(ref.entity, ref.key_id):
                     pre.blocked.append(
                         {
@@ -366,11 +577,17 @@ def reconstruct_pre_state(
                             "tool": inv.tool,
                             "entity": ref.entity,
                             "row_key": ref.key,
+                            "partial": ref.partial,
                             "reason": "read after a write to this row; post-state, not pre-state",
                         }
                     )
                     continue
-                pre.add(ref)
+                if pre.add(ref) and ref.partial:
+                    pre.notes.append(
+                        f"step {inv.step}: {inv.tool} named {ref.entity}[{ref.key!r}] in an id "
+                        f"list without ever reading it; seeded as a PARTIAL row "
+                        f"({sorted(ref.row)}) - existence is proven, contents are not"
+                    )
             continue
 
         # a write: everything it touched is post-state from here on

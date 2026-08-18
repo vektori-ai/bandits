@@ -106,27 +106,38 @@ def golden_surface() -> ToolSurface:
 
 
 def corpus_from_calls(
-    calls_by_trace: dict[str, list[tuple[str, dict, Any]]],
+    calls_by_trace: dict[str, list[tuple]],
 ) -> TraceCorpus:
-    """Build a tiny corpus from ``{trace_id: [(tool, arguments, response), ...]}``."""
+    """Build a tiny corpus from ``{trace_id: [(tool, arguments, response), ...]}``.
+
+    A call may carry an optional fourth element, ``"ok"`` or ``"error"``, so a
+    test can exercise the "errored calls are not evidence" rule. Omitted means
+    ``"ok"``.
+    """
     traces = []
     for tid, calls in calls_by_trace.items():
+        invocations = []
+        for i, call in enumerate(calls):
+            tool, args, resp = call[0], call[1], call[2]
+            status = call[3] if len(call) > 3 else "ok"
+            invocations.append(
+                InvocationPoint(
+                    call_id=f"{tid}-{i}",
+                    trace_id=tid,
+                    step=i,
+                    tool=tool,
+                    arguments=args,
+                    response=resp,
+                    status=CallStatus.ERROR if status == "error" else CallStatus.OK,
+                    error_kind="synthetic" if status == "error" else None,
+                )
+            )
         traces.append(
             Trace(
                 trace_id=tid,
                 source="synthetic",
                 source_digest="0" * 64,
-                invocations=tuple(
-                    InvocationPoint(
-                        call_id=f"{tid}-{i}",
-                        trace_id=tid,
-                        step=i,
-                        tool=tool,
-                        arguments=args,
-                        response=resp,
-                    )
-                    for i, (tool, args, resp) in enumerate(calls)
-                ),
+                invocations=tuple(invocations),
             )
         )
     return TraceCorpus(source="synthetic", traces=tuple(traces))

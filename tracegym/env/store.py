@@ -263,9 +263,19 @@ class Store:
         values = [cols[n].encode(row[n]) for n in names]
         placeholders = ", ".join("?" for _ in names)
         quoted = ", ".join(_ident(n, "field") for n in names)
-        self.conn.execute(
-            f"INSERT INTO {_ident(entity, 'entity')} ({quoted}) VALUES ({placeholders})", values
-        )
+        try:
+            self.conn.execute(
+                f"INSERT INTO {_ident(entity, 'entity')} ({quoted}) VALUES ({placeholders})", values
+            )
+        except sqlite3.DatabaseError as exc:
+            # A constraint the inferred schema imposed but the data does not
+            # satisfy -- almost always a wrong primary key. Surface it as a
+            # StoreError so callers see "this schema does not hold" rather than
+            # a raw driver exception leaking out of the environment.
+            raise StoreError(
+                f"could not seed {entity!r} row {canonical_json(row)}: {exc}. "
+                "The inferred schema contradicts the data; fix the schema, do not relax it."
+            ) from exc
         self.conn.commit()
 
     def _insert_static(self, entity: str, row: JsonObject) -> None:

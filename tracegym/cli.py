@@ -243,7 +243,7 @@ def _run_gate(
     criteria: GateCriteria,
 ) -> FidelityBundle:
     tool_classes = tool_classes_from_surface(surface)
-    results = replay_corpus(corpus, schema, tasks, tool_classes)
+    results = replay_corpus(corpus, schema, tasks, tool_classes, surface=surface)
     per_trace = tuple(build_report([r], criteria=criteria) for r in results)
     overall = build_report(results, criteria=criteria)
     return FidelityBundle(overall=overall, per_trace=per_trace)

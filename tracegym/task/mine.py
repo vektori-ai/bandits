@@ -7,6 +7,14 @@ paraphrase we invented. The starting state is whatever
 outcome label rides along unchanged; stage 6 refuses to synthesize a reward
 function from anything that is not labeled correct.
 
+``provenance`` carries one convention worth naming here, because ``EntityRows``
+has no field for it: ``provenance["partial_pre_state_rows"]`` maps an entity name
+to the keys of its **partial** rows - rows production only *named* (an id in a
+list) and never showed. Those rows sit in ``pre_state`` like any other, but only
+their key and the query filters that produced them are known; the remaining
+columns are unknown, not empty. Anything that would read an absent column as
+evidence must consult this list first. See :mod:`tracegym.task.prestate`.
+
 Nothing is silently skipped (BUILD_PLAN rule 6). A trace we decline to turn into
 a task lands in :attr:`MiningResult.skipped` with a reason.
 """
@@ -60,6 +68,7 @@ def mine_task(
         "invocation_count": len(trace.invocations),
         "first_write_step": pre.first_write_step,
         "pre_state_row_count": sum(len(b) for b in pre.rows.values()),
+        "partial_pre_state_rows": {k: tuple(v) for k, v in pre.partial_row_keys().items()},
         "blocked_post_state_reads": tuple(pre.blocked),
         "solvability_warnings": tuple(pre.warnings),
         "notes": tuple(pre.notes),

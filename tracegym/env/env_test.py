@@ -19,6 +19,9 @@ from tracegym.contracts import (
     StateSchema,
     TaskCase,
     ToolClass,
+    ToolProfile,
+    ToolSurface,
+    WriteEffect,
 )
 from tracegym.env import (
     EffectLedger,
@@ -497,3 +500,201 @@ def test_file_backed_store_is_deleted_at_close():
         s.execute("refund_order", {"order_id": 7741, "amount_cents": 4200})
     assert not os.path.exists(path)
     s.close()  # idempotent
+
+
+# ---------------------------------------------------------------- projection
+
+
+def orders_with_refund_column(write_effects=()) -> StateSchema:
+    """The retail schema, plus the column ``refund_order`` teaches ``orders``.
+
+    This is the real shape of the defect: ``refund_amount_cents`` is a
+    legitimate column of the table, inferred from a *write* tool's response,
+    which ``get_order`` never returned.
+    """
+    schema = retail_schema()
+    orders = schema.entity("orders")
+    grown = EntitySchema(
+        **{
+            **orders.model_dump(),
+            "fields": (*orders.fields, f("refund_amount_cents", "integer", samples=[4200])),
+            "write_effects": tuple(write_effects),
+        }
+    )
+    return StateSchema(
+        entities=tuple(grown if e.name == "orders" else e for e in schema.entities)
+    )
+
+
+def retail_surface() -> ToolSurface:
+    """A stage-2 surface recording what each read tool was seen to return."""
+
+    def profile(name, klass, response):
+        return ToolProfile(
+            name=name,
+            tool_class=klass,
+            call_count=1,
+            response_fields=tuple(f(r, "string") for r in response),
+        )
+
+    return ToolSurface(
+        tools=(
+            profile("get_order", ToolClass.READ,
+                    ["order_id", "customer_id", "sku", "status", "total_cents", "placed_at"]),
+            profile("get_customer", ToolClass.READ,
+                    ["customer_id", "name", "email", "tier"]),
+            profile("search_orders", ToolClass.READ, ["order_ids", "order_ids[]"]),
+        )
+    )
+
+
+def test_read_returns_only_the_fields_the_tool_was_observed_to_return():
+    """get_order must not leak refund_amount_cents just because the table has it."""
+    schema = orders_with_refund_column([REFUND_EFFECT])
+    with TraceGymSession(
+        schema, retail_task(), TOOL_CLASSES, surface=retail_surface()
+    ) as s:
+        row = s.execute("get_order", {"order_id": 7741}).response
+        assert set(row) == {
+            "order_id", "customer_id", "sku", "status", "total_cents", "placed_at"
+        }
+        # ...and it stays projected after a write populates the extra column.
+        s.execute("refund_order", {"order_id": 7741, "amount_cents": 4200})
+        after = s.execute("get_order", {"order_id": 7741}).response
+        assert "refund_amount_cents" not in after
+        assert after["status"] == "refunded"
+        # The column is really there; only the response is narrowed.
+        assert s.snapshot()["orders"][0]["refund_amount_cents"] == 4200
+
+
+def test_projection_narrows_rows_in_a_list_response_too():
+    surface = retail_surface()
+    rule = ReadRule(
+        tool="search_orders", entity="orders", filter_args={"customer_id": "customer_id"},
+        projection=("order_id", "status"), envelope="orders", inferred=False,
+    )
+    with TraceGymSession(
+        orders_with_refund_column(), retail_task(), TOOL_CLASSES,
+        surface=surface, rules={"search_orders": rule},
+    ) as s:
+        rows = s.execute("search_orders", {"customer_id": 88}).response["orders"]
+        assert all(set(r) == {"order_id", "status"} for r in rows)
+
+
+def test_read_rule_projection_overrides_the_surface():
+    """A human override beats the observed evidence, like the write rules do."""
+    override = ReadRule(
+        tool="get_order", entity="orders", key_column="order_id",
+        projection=("order_id", "status"), inferred=False,
+    )
+    with TraceGymSession(
+        orders_with_refund_column(), retail_task(), TOOL_CLASSES,
+        surface=retail_surface(), rules={"get_order": override},
+    ) as s:
+        assert s.execute("get_order", {"order_id": 7741}).response == {
+            "order_id": 7741, "status": "delivered",
+        }
+
+
+def test_without_a_surface_null_columns_are_omitted_and_that_is_weaker():
+    """The documented fallback, including the case where it is wrong.
+
+    No surface means no evidence of the tool's field set, so NULL columns are
+    dropped. That is right for a column this tool never returned and never
+    populated -- and wrong the moment a write populates it, which is exactly
+    what the second half of this test pins down. It is a heuristic, not a fix.
+    """
+    schema = orders_with_refund_column([REFUND_EFFECT])
+    with TraceGymSession(schema, retail_task(), TOOL_CLASSES) as s:
+        row = s.execute("get_order", {"order_id": 7741}).response
+        assert "refund_amount_cents" not in row  # NULL, so omitted
+        assert row["status"] == "delivered"
+
+        s.execute("refund_order", {"order_id": 7741, "amount_cents": 4200})
+        after = s.execute("get_order", {"order_id": 7741}).response
+        # The heuristic's blind spot, asserted rather than hidden:
+        assert after["refund_amount_cents"] == 4200
+
+
+# ---------------------------------------------------------------- write effects
+
+
+REFUND_EFFECT = WriteEffect(
+    tool="refund_order",
+    key_argument="order_id",
+    argument_columns={"amount_cents": "refund_amount_cents"},
+    sets_constants={"status": "refunded"},
+    response_echoes=("order_id", "status", "refund_amount_cents"),
+    evidence_count=3,
+    confidence=0.8,
+)
+
+
+def test_write_effect_maps_the_argument_onto_a_differently_named_column():
+    schema = orders_with_refund_column([REFUND_EFFECT])
+    with TraceGymSession(schema, retail_task(), TOOL_CLASSES) as s:
+        obs = s.execute("refund_order", {"order_id": 7741, "amount_cents": 4200})
+        assert obs.status is CallStatus.OK
+        assert s.snapshot()["orders"][0]["refund_amount_cents"] == 4200
+        assert s.snapshot()["orders"][0]["status"] == "refunded"
+
+
+def test_write_effect_response_echoes_shape_the_response():
+    schema = orders_with_refund_column([REFUND_EFFECT])
+    with TraceGymSession(schema, retail_task(), TOOL_CLASSES) as s:
+        obs = s.execute("refund_order", {"order_id": 7741, "amount_cents": 4200})
+        assert obs.response == {
+            "order_id": 7741, "status": "refunded", "refund_amount_cents": 4200,
+        }
+
+
+def test_write_effect_rule_still_reproduces_the_conflict_error():
+    schema = orders_with_refund_column([REFUND_EFFECT])
+    with TraceGymSession(schema, retail_task(), TOOL_CLASSES) as s:
+        s.execute("refund_order", {"order_id": 7741, "amount_cents": 4200})
+        again = s.execute("refund_order", {"order_id": 7741, "amount_cents": 4200})
+        assert again.status is CallStatus.ERROR
+        assert again.error_kind == "already_refunded"
+
+
+def test_write_effect_is_authoritative_over_the_verb_guess():
+    """The constant comes from evidence, not from the tool's English name."""
+    effect = WriteEffect(
+        tool="refund_order",
+        key_argument="order_id",
+        argument_columns={"amount_cents": "refund_amount_cents"},
+        sets_constants={"status": "in_transit"},  # deliberately not "refunded"
+        response_echoes=("order_id", "status"),
+    )
+    schema = orders_with_refund_column([effect])
+    rule = infer_rule(schema, "refund_order", ToolClass.WRITE)
+    assert isinstance(rule, WriteRule)
+    assert rule.set_values == {"status": "in_transit"}
+    assert rule.column_map["amount_cents"] == "refund_amount_cents"
+
+
+def test_empty_write_effects_fall_back_to_the_previous_behaviour():
+    """The parallel-stage case: nothing recorded, so the old path still runs."""
+    schema = orders_with_refund_column()  # no write_effects at all
+    rule = infer_rule(schema, "refund_order", ToolClass.WRITE)
+    assert isinstance(rule, WriteRule)
+    assert rule.set_values == {"status": "refunded"}  # last-resort verb guess
+    assert rule.column_map is None
+    assert rule.response_columns is None
+    with TraceGymSession(schema, retail_task(), TOOL_CLASSES) as s:
+        obs = s.execute("refund_order", {"order_id": 7741, "amount_cents": 4200})
+        assert obs.response == {"order_id": 7741, "status": "refunded"}
+
+
+def test_write_effect_identity_arguments_still_map():
+    """argument_columns lists only the renames; identical names must still work."""
+    effect = WriteEffect(
+        tool="update_order_status",
+        key_argument="order_id",
+        response_echoes=("order_id", "status"),
+    )
+    schema = orders_with_refund_column([effect])
+    with TraceGymSession(schema, retail_task(), TOOL_CLASSES) as s:
+        obs = s.execute("update_order_status", {"order_id": 7742, "status": "delivered"})
+        assert obs.response == {"order_id": 7742, "status": "delivered"}
+        assert s.execute("get_order", {"order_id": 7742}).response["status"] == "delivered"

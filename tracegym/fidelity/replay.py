@@ -203,6 +203,35 @@ def _example(result: ReplayResult, call: CallReplay) -> JsonObject:
     return example
 
 
+def _unbuildable(
+    trace: Trace, task: TaskCase, env_id: str | None, exc: Exception
+) -> ReplayResult:
+    """Report a trace whose environment could not be constructed at all.
+
+    Every recorded call becomes ``unsupported`` rather than ``mismatched``.
+    The distinction is the whole point of the gate: "we could not model this"
+    and "we modelled it wrong" have different fixes, and collapsing them would
+    tell an operator to go debug a comparison that never ran.
+    """
+    reason = f"environment could not be built: {type(exc).__name__}: {exc}"
+    result = ReplayResult(
+        trace_id=trace.trace_id,
+        task_id=task.task_id,
+        env_id=env_id or f"env-{task.task_id}-unbuildable",
+    )
+    result.notes.append(reason)
+    for inv in sorted(trace.invocations, key=lambda i: i.step):
+        result.calls.append(
+            CallReplay(
+                step=inv.step,
+                tool=inv.tool,
+                verdict="unsupported",
+                unsupported_reason=reason,
+            )
+        )
+    return result
+
+
 # -- the replay ------------------------------------------------------------
 
 
@@ -212,6 +241,7 @@ def replay_trace(
     task: TaskCase,
     tool_classes: Mapping[str, ToolClass],
     *,
+    surface: ToolSurface | None = None,
     rules: Mapping[str, object] | None = None,
     external_stubs: Mapping[str, object] | None = None,
     env_id: str | None = None,
@@ -220,6 +250,12 @@ def replay_trace(
 
     ``task`` must have been mined from ``trace``; a mismatch is a caller bug and
     raises rather than silently measuring the wrong pair.
+
+    Pass ``surface`` whenever it is available. Without it the environment falls
+    back to omitting NULL columns from read responses, which is a strictly
+    weaker guess than the observed response projection and shows up directly as
+    lost fidelity -- a read starts emitting a key production never sent as soon
+    as some write populates that column.
     """
     if task.trace_id != trace.trace_id:
         raise ValueError(
@@ -227,14 +263,23 @@ def replay_trace(
             f"not {trace.trace_id!r}; replaying them together would measure nothing"
         )
 
-    session = build_session(
-        schema,
-        task,
-        tool_classes,
-        rules=rules,  # type: ignore[arg-type]
-        external_stubs=external_stubs,  # type: ignore[arg-type]
+    try:
+        session = build_session(
+            schema,
+            task,
+            tool_classes,
+            surface=surface,
+            rules=rules,  # type: ignore[arg-type]
+            external_stubs=external_stubs,  # type: ignore[arg-type]
         env_id=env_id,
-    )
+        )
+    except EnvError as exc:
+        # The environment could not even be built for this task -- typically an
+        # inferred schema that contradicts the data it must hold. That is a
+        # reconstruction failure, not a per-call mismatch, so every recorded
+        # call is reported unsupported rather than letting the exception escape
+        # and take the whole gate run down with it.
+        return _unbuildable(trace, task, env_id, exc)
     manifest = session.manifest()
     result = ReplayResult(
         trace_id=trace.trace_id,

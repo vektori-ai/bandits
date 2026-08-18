@@ -19,6 +19,7 @@ Module map:
 * :mod:`tracegym.state.identifiers` - which fields carry row handles.
 * :mod:`tracegym.state.entities`    - grouping, naming, fields, reads/writes.
 * :mod:`tracegym.state.relations`   - foreign keys.
+* :mod:`tracegym.state.writes`      - what each write tool actually writes.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from .entities import (
 )
 from .identifiers import find_identifiers
 from .relations import cross_referenced, infer_foreign_keys
+from .writes import infer_write_effects
 
 
 def _is_static(draft: EntityDraft, writers: set[str], is_cross_referenced: bool) -> bool:
@@ -72,6 +74,13 @@ def infer_schema(corpus: TraceCorpus, surface: ToolSurface | None = None) -> Sta
     trace (:func:`tracegym.state.entities.infer_writers`), which can only see a
     write whose effect is later observed.
 
+    Each entity also carries a :class:`~tracegym.contracts.WriteEffect` for
+    every tool in ``written_by``, recording *what* that tool was observed to
+    write - the key argument, the columns it always sets to a constant, the
+    arguments whose values land in columns, and the columns it echoes back. See
+    :mod:`tracegym.state.writes`. Downstream stages must use this instead of
+    reading write semantics out of the tool's English name.
+
     Entities are returned sorted with the modelled tables first, then the static
     snapshots, alphabetically within each group. ``unresolved`` holds tools
     whose successful responses could not be attributed to any entity - without a
@@ -100,14 +109,16 @@ def infer_schema(corpus: TraceCorpus, surface: ToolSurface | None = None) -> Sta
             if draft.anchor_field is None
             else [o.body for o in draft.observations]
         )
+        fields = build_field_profiles(bodies, primary_keys)
         entities.append(
             EntitySchema(
                 name=draft.name,
                 primary_key=draft.anchor_field,
-                fields=build_field_profiles(bodies, primary_keys),
+                fields=fields,
                 foreign_keys=foreign_keys.get(draft.name, ()),
                 written_by=tuple(sorted(writers)),
                 read_by=tuple(sorted(readers)),
+                write_effects=infer_write_effects(draft, writers, {f.name for f in fields}),
                 evidence_count=draft.evidence_count,
                 static_snapshot=static,
             )
@@ -117,4 +128,4 @@ def infer_schema(corpus: TraceCorpus, surface: ToolSurface | None = None) -> Sta
     return StateSchema(entities=tuple(entities), unresolved=tuple(sorted(unresolved)))
 
 
-__all__ = ["infer_schema"]
+__all__ = ["infer_schema", "infer_write_effects"]

@@ -25,6 +25,7 @@ from tracegym.contracts import (
     StateSchema,
     TaskCase,
     ToolClass,
+    ToolSurface,
 )
 
 from .interface import BaseEnvSession, SessionClosedError
@@ -55,6 +56,14 @@ class TraceGymSession(BaseEnvSession):
         ``tool -> response`` for EXTERNAL tools, so the stub can match the
         acknowledgement the real tool returned. It is still only an
         acknowledgement: nothing is performed.
+    surface:
+        The stage-2 :class:`ToolSurface`, optional. When given, each READ tool
+        answers with the field set it was *observed* to return
+        (``ToolProfile.response_fields``) instead of every column of the table
+        it reads -- a table is the union of all its writers' and readers'
+        fields, so ``SELECT *`` leaks keys production never sent. Omitting it
+        keeps the old behaviour minus NULL columns; see :class:`ReadRule` for
+        why that fallback is weaker than real evidence.
     db_path:
         Where SQLite lives. ``None`` means in-memory (default); pass a path to
         keep the store for inspection. A temp file we create is deleted at close.
@@ -68,6 +77,7 @@ class TraceGymSession(BaseEnvSession):
         *,
         rules: Mapping[str, Rule] | None = None,
         external_stubs: Mapping[str, JsonValue] | None = None,
+        surface: ToolSurface | None = None,
         db_path: str | None = None,
         env_id: str | None = None,
     ) -> None:
@@ -77,6 +87,7 @@ class TraceGymSession(BaseEnvSession):
         self.tool_classes = dict(tool_classes)
         self._rule_overrides = dict(rules or {})
         self._external_stubs = dict(external_stubs or {})
+        self.surface = surface
         self._db_path = db_path
         self._own_tempfile = False
         self._env_id = env_id
@@ -104,6 +115,7 @@ class TraceGymSession(BaseEnvSession):
             self.ledger,
             rules=self._rule_overrides,
             external_stubs=self._external_stubs,
+            surface=self.surface,
         )
         self._manifest = self._build_manifest()
 
@@ -176,9 +188,17 @@ def build_session(
     schema: StateSchema,
     task: TaskCase,
     tool_classes: Mapping[str, ToolClass],
+    *,
+    surface: ToolSurface | None = None,
     **kwargs,
 ) -> TraceGymSession:
-    """Materialize and open an environment in one call."""
-    session = TraceGymSession(schema, task, tool_classes, **kwargs)
+    """Materialize and open an environment in one call.
+
+    ``surface`` is optional and backward compatible: callers that pass none get
+    the previous behaviour (minus NULL columns on reads). Callers that have the
+    stage-2 surface should pass it -- it is what lets a read return the tool's
+    observed field set rather than the whole table.
+    """
+    session = TraceGymSession(schema, task, tool_classes, surface=surface, **kwargs)
     session.open()
     return session

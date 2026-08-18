@@ -109,7 +109,7 @@ def test_fidelity_json_carries_the_actual_numbers(ran):
     _, out = ran
     bundle = FidelityBundle.model_validate_json((out / "fidelity.json").read_text())
     rates = {t.tool: (t.matched, t.replayed) for t in bundle.overall.per_tool}
-    assert rates["get_order"] == (1, 8)
+    assert rates["get_order"] == (7, 8)
     assert rates["send_email"] == (3, 3)
     assert sum(t.replayed for t in bundle.overall.per_tool) == 23
 

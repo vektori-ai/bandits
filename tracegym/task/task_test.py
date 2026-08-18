@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from tracegym.contracts import EntityRows, TaskCase
+from tracegym.ingest import load_corpus, load_registry
+from tracegym.state import infer_schema
+from tracegym.surface import build_surface
 from tracegym.task._testdata import (
+    POLICY,
     RETAIL_SCHEMA,
     WRITE_TOOLS,
     corpus,
@@ -16,7 +22,11 @@ from tracegym.task._testdata import (
 )
 from tracegym.task.filler import FillerError, fill_task, generate_filler
 from tracegym.task.mine import mine_task, mine_tasks
-from tracegym.task.prestate import reconstruct_final_state, reconstruct_pre_state
+from tracegym.task.prestate import (
+    attribute_object,
+    reconstruct_final_state,
+    reconstruct_pre_state,
+)
 
 
 def _rows(pre_state: tuple[EntityRows, ...], entity: str) -> list[dict]:
@@ -39,10 +49,11 @@ def test_post_write_read_does_not_leak_into_pre_state():
     state and the reward signal is silently dead."""
     pre = reconstruct_pre_state(ep_refund_ok(), RETAIL_SCHEMA)
     orders = _rows(pre.to_entity_rows(), "orders")
-    assert len(orders) == 1
-    assert orders[0]["order_id"] == 7741
-    assert orders[0]["status"] == "delivered"
-    assert orders[0]["status"] != "refunded"
+    row = next(r for r in orders if r["order_id"] == 7741)
+    assert row["status"] == "delivered"
+    assert row["status"] != "refunded"
+    # no row anywhere in the pre-state carries the value the episode produced
+    assert not any(r.get("status") == "refunded" for r in orders)
     # and the rejection is auditable, not silent
     assert any(b["step"] == 5 and b["entity"] == "orders" for b in pre.blocked)
     assert pre.first_write_step == 4
@@ -52,7 +63,10 @@ def test_write_response_row_is_not_pre_state_evidence():
     """The refund_order response itself carries status='refunded'. It is a write,
     so it never contributes rows to the pre-state."""
     pre = reconstruct_pre_state(ep_refund_ok(), RETAIL_SCHEMA)
-    assert all(r["status"] == "delivered" for r in _rows(pre.to_entity_rows(), "orders"))
+    # 7742 is a partial row and carries no status at all; 7741 is observed and
+    # must carry the pre-write one.
+    observed = [r for r in _rows(pre.to_entity_rows(), "orders") if "status" in r]
+    assert observed and all(r["status"] == "delivered" for r in observed)
 
 
 def test_explicit_write_tool_override_matches_schema_derived_set():
@@ -282,3 +296,177 @@ def test_final_state_is_the_post_write_view():
 def test_mine_task_returns_a_taskcase_contract():
     task, _, _ = mine_task(ep_refund_ok(), RETAIL_SCHEMA)
     assert isinstance(task, TaskCase)
+
+
+# --------------------------------------------------------------------------
+# static-snapshot entities: attributed by content, not by key
+# --------------------------------------------------------------------------
+
+
+def test_static_snapshot_is_seeded_from_a_keyless_body():
+    """store_policy has primary_key=None BY DEFINITION - that is what makes it a
+    static snapshot. If attribution demands a key, the feature is unreachable at
+    runtime and every environment starts with an empty table."""
+    pre = reconstruct_pre_state(ep_refund_ok(), RETAIL_SCHEMA)
+    assert _rows(pre.to_entity_rows(), "store_policy") == [{"policy": POLICY}]
+
+
+def test_duplicate_static_bodies_are_deduplicated():
+    """Two reads of the same snapshot are one row, not two: content is the key."""
+    trace = ep_refund_ok()
+    again = trace.invocations[3].model_copy(update={"step": 7, "call_id": "again"})
+    t2 = trace.model_copy(update={"invocations": (*trace.invocations, again)})
+    pre = reconstruct_pre_state(t2, RETAIL_SCHEMA)
+    assert _rows(pre.to_entity_rows(), "store_policy") == [{"policy": POLICY}]
+
+    # ...but a genuinely different body is a second row
+    other = trace.invocations[3].model_copy(
+        update={"step": 8, "call_id": "other", "response": {"policy": "No refunds."}}
+    )
+    t3 = trace.model_copy(update={"invocations": (*trace.invocations, other)})
+    rows = _rows(reconstruct_pre_state(t3, RETAIL_SCHEMA).to_entity_rows(), "store_policy")
+    assert rows == [{"policy": POLICY}, {"policy": "No refunds."}]
+
+
+def test_static_attribution_never_steals_a_keyed_row():
+    """Containment, not overlap: an orders body can never land in store_policy."""
+    hit = attribute_object({"order_id": 7741, "status": "delivered"}, RETAIL_SCHEMA)
+    assert hit == ("orders", 7741)
+    assert attribute_object({"sent": True}, RETAIL_SCHEMA) is None
+
+
+def test_static_snapshot_rows_are_never_partial():
+    """A static snapshot is never written, so every observation of it is valid
+    pre-state and its rows are fully observed."""
+    pre = reconstruct_pre_state(ep_refund_ok(), RETAIL_SCHEMA)
+    assert "store_policy" not in pre.partial_row_keys()
+
+
+# --------------------------------------------------------------------------
+# partial rows: entities production NAMED but never showed
+# --------------------------------------------------------------------------
+
+
+def test_id_list_only_row_is_seeded_partial_and_marked_in_provenance():
+    """search_orders(customer_id=88) -> {"order_ids": [7741, 7742]}. 7742 is
+    never read, but production proved it exists; dropping it makes the replayed
+    search return one id where production returned two."""
+    task, _, pre = mine_task(ep_refund_ok(), RETAIL_SCHEMA)
+    assert task is not None and pre is not None
+    rows = {r["order_id"]: r for r in _rows(task.pre_state, "orders")}
+    assert set(rows) == {7741, 7742}
+
+    # the partial row carries ONLY what production stated: the key, plus the
+    # equality filter the search itself applied.
+    assert rows[7742] == {"order_id": 7742, "customer_id": 88}
+
+    # and it is distinguishable from an observed row, out of band
+    assert task.provenance["partial_pre_state_rows"] == {"orders": (7742,)}
+    assert pre.partial_row_keys() == {"orders": [7742]}
+    assert any("PARTIAL" in n for n in pre.notes)
+
+
+def test_a_row_that_was_actually_read_is_not_marked_partial():
+    """7741 is named by the same id list AND read in full. Once the body arrives
+    the row stops being partial - in either order."""
+    pre = reconstruct_pre_state(ep_refund_ok(), RETAIL_SCHEMA)
+    assert 7741 not in pre.partial_row_keys()["orders"]
+    row = next(r for r in _rows(pre.to_entity_rows(), "orders") if r["order_id"] == 7741)
+    assert row["status"] == "delivered"
+
+    # reversed order: the id list arrives after the full read
+    trace = ep_refund_ok()
+    invs = list(trace.invocations)
+    invs[1], invs[2] = (
+        invs[2].model_copy(update={"step": 1}),
+        invs[1].model_copy(update={"step": 2}),
+    )
+    reordered = reconstruct_pre_state(trace.model_copy(update={"invocations": tuple(invs)}),
+                                      RETAIL_SCHEMA)
+    assert reordered.partial_row_keys() == {"orders": [7742]}
+
+
+def test_id_list_read_after_a_write_to_that_row_is_still_refused():
+    """Partial rows obey the same pre/post-write discipline as observed ones."""
+    trace = ep_status_update()  # get_order 7742, update_order_status 7742, get_order 7742
+    late = trace.invocations[0].model_copy(
+        update={
+            "step": 3,
+            "call_id": "late",
+            "tool": "search_orders",
+            "arguments": {"customer_id": 88},
+            "response": {"order_ids": [7742, 7799]},
+        }
+    )
+    pre = reconstruct_pre_state(trace.model_copy(
+        update={"invocations": (*trace.invocations, late)}), RETAIL_SCHEMA)
+    ids = {r["order_id"] for r in _rows(pre.to_entity_rows(), "orders")}
+    assert 7799 in ids  # a clean row named after the write is still fine
+    assert pre.partial_row_keys() == {"orders": [7799]}
+    assert any(b["row_key"] == 7742 and b["partial"] for b in pre.blocked)
+    # 7742's observed pre-write body survives; the post-write naming adds nothing
+    row = next(r for r in _rows(pre.to_entity_rows(), "orders") if r["order_id"] == 7742)
+    assert row["status"] == "in_transit"
+
+
+def test_id_lists_from_unrelated_tools_are_ignored():
+    """Only a tool the schema already lists in read_by is trusted to be naming
+    that entity's ids. A bare integer array from anything else is left alone."""
+    trace = ep_refund_ok()
+    stray = trace.invocations[1].model_copy(
+        update={"tool": "send_email", "step": 8, "call_id": "stray"}
+    )
+    pre = reconstruct_pre_state(
+        trace.model_copy(update={"invocations": (trace.invocations[0], stray)}), RETAIL_SCHEMA
+    )
+    assert _rows(pre.to_entity_rows(), "orders") == []
+
+
+def test_partial_row_does_not_defeat_the_filler_or_the_solvability_check():
+    task, _, _ = mine_task(ep_refund_ok(), RETAIL_SCHEMA)
+    assert task is not None
+    assert task.provenance["solvability_warnings"] == ()
+    filled = fill_task(task, RETAIL_SCHEMA, seed=11, count_per_entity=5)
+    orders = _rows(filled, "orders")
+    assert orders[0]["order_id"] == 7741 and orders[0]["status"] == "delivered"
+    assert orders[1] == {"order_id": 7742, "customer_id": 88}
+    assert len({r["order_id"] for r in orders}) == len(orders)
+
+
+# --------------------------------------------------------------------------
+# against the REAL pipeline, not only hand-built fixtures
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def real_pipeline():
+    fixtures = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
+    corpus = load_corpus(fixtures / "traces.otlp.jsonl", "otlp")
+    surface = build_surface(corpus, declared_tools=load_registry(fixtures / "tools.json"))
+    schema = infer_schema(corpus, surface)
+    return corpus, schema, mine_tasks(corpus, schema)
+
+
+def test_real_pipeline_seeds_the_static_snapshot_and_the_partial_row(real_pipeline):
+    """The hand-written RETAIL_SCHEMA is a model of the inferred one. This test
+    uses the inferred one, so a drift in stages 1-3 cannot hide behind it."""
+    _corpus, schema, mining = real_pipeline
+    policy_entity = next(e for e in schema.entities if e.static_snapshot)
+    assert policy_entity.primary_key is None
+
+    task = next(t for t in mining.tasks if t.trace_id == "ep-refund-ok")
+    assert _rows(task.pre_state, policy_entity.name) == [{"policy": POLICY}]
+
+    orders = {r["order_id"]: r for r in _rows(task.pre_state, "orders")}
+    assert set(orders) == {7741, 7742}
+    assert orders[7741]["status"] == "delivered"  # STILL not 'refunded'
+    assert orders[7742] == {"order_id": 7742, "customer_id": 88}
+    assert task.provenance["partial_pre_state_rows"] == {"orders": (7742,)}
+
+
+def test_real_pipeline_marks_no_partial_rows_where_there_are_none(real_pipeline):
+    _corpus, _schema, mining = real_pipeline
+    for task in mining.tasks:
+        if task.trace_id == "ep-refund-ok":
+            continue
+        assert task.provenance["partial_pre_state_rows"] == {}, task.task_id

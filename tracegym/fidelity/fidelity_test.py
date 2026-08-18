@@ -68,7 +68,11 @@ def golden():
 @pytest.fixture(scope="module")
 def golden_report(golden) -> FidelityReport:
     results = replay_corpus(
-        golden["corpus"], golden["schema"], golden["tasks"], golden["tool_classes"]
+        golden["corpus"],
+        golden["schema"],
+        golden["tasks"],
+        golden["tool_classes"],
+        surface=golden["surface"],
     )
     return build_report(results)
 
@@ -77,17 +81,26 @@ def golden_report(golden) -> FidelityReport:
 #: A regression moves one of these. Recorded, not aspirational.
 GOLDEN_PER_TOOL: dict[str, tuple[int, int]] = {
     "get_customer": (2, 2),
-    "get_order": (1, 8),
+    "get_order": (7, 8),
     "get_product": (2, 2),
-    "get_store_policy": (0, 2),
-    "refund_order": (0, 4),
-    "search_orders": (0, 1),
+    "get_store_policy": (2, 2),
+    "refund_order": (3, 4),
+    "search_orders": (1, 1),
     "send_email": (3, 3),
     "update_order_status": (1, 1),
 }
-GOLDEN_MATCHED = 9
+GOLDEN_MATCHED = 21
 GOLDEN_REPLAYED = 23
-GOLDEN_OVERALL = 9 / 23  # 39.1%
+GOLDEN_OVERALL = 21 / 23  # 91.3%
+
+#: Both remaining mismatches come from ``ep-double-refund``, whose very first
+#: call is a write. With no pre-write read there is nothing to reconstruct the
+#: row from, so the environment answers ``not_found`` where production answered
+#: ``already_refunded``. That is an epistemic limit of the trace, not a defect:
+#: an agent that writes before it reads leaves no record of the prior world.
+#: The corpus stays REJECTED because ``refund_order`` sits at 75%, below the
+#: per-tool floor, even though the 91% overall clears the threshold -- which is
+#: the entire reason the floor exists.
 
 
 def test_golden_pipeline_produces_a_report(golden_report):
@@ -113,7 +126,11 @@ def test_golden_covers_every_called_tool(golden):
     """Every tool with a recorded call gets a row; a never-called tool does not."""
     called = {inv.tool for tr in golden["corpus"].traces for inv in tr.invocations}
     results = replay_corpus(
-        golden["corpus"], golden["schema"], golden["tasks"], golden["tool_classes"]
+        golden["corpus"],
+        golden["schema"],
+        golden["tasks"],
+        golden["tool_classes"],
+        surface=golden["surface"],
     )
     report = build_report(results)
     assert {t.tool for t in report.per_tool} == called
@@ -123,12 +140,17 @@ def test_golden_covers_every_called_tool(golden):
 
 
 def test_golden_is_rejected_and_says_why(golden_report):
-    """39% is not a model of anything. The notes must name the tools to fix."""
+    """91% overall clears the threshold; one tool below the floor still rejects.
+
+    This is the whole argument for a per-tool floor. An aggregate-only gate
+    would have accepted this environment and shipped a broken ``refund_order``.
+    """
     assert golden_report.accepted is False
     text = "\n".join(golden_report.notes)
-    for tool in ("get_order", "refund_order", "get_store_policy", "search_orders"):
-        assert tool in text
-    assert "below the 90% threshold" in text
+    assert "refund_order" in text
+    assert "per-tool floor" in text
+    # The overall rate is ABOVE the threshold, so that must not be the reason.
+    assert "below the 90% threshold" not in text
 
 
 def test_examples_are_carried_for_every_failing_tool(golden_report):
@@ -197,7 +219,9 @@ def test_external_tool_that_logs_nothing_is_a_mismatch(golden):
 def _unsupported_run(golden, tool: str = "get_order"):
     classes = dict(golden["tool_classes"])
     classes[tool] = ToolClass.UNKNOWN  # "not enough evidence to reimplement it"
-    results = replay_corpus(golden["corpus"], golden["schema"], golden["tasks"], classes)
+    results = replay_corpus(
+        golden["corpus"], golden["schema"], golden["tasks"], classes, surface=golden["surface"]
+    )
     return build_report(results)
 
 
@@ -218,7 +242,9 @@ def test_unsupported_stays_in_the_denominator(golden):
     assert row.rate == 0.0
     assert sum(t.replayed for t in report.per_tool) == GOLDEN_REPLAYED
     # get_order went from 1 matched to 0, and nothing else moved.
-    assert sum(t.matched for t in report.per_tool) == GOLDEN_MATCHED - 1
+    # get_order was forced UNKNOWN, so all 8 of its calls become unsupported
+    # and its 7 previously-matched calls leave the matched total.
+    assert sum(t.matched for t in report.per_tool) == GOLDEN_MATCHED - GOLDEN_PER_TOOL["get_order"][0]
     assert report.accepted is False
 
 
@@ -347,7 +373,9 @@ def _break_orders_primary_key(schema: StateSchema) -> StateSchema:
 def test_a_broken_schema_is_rejected(golden, golden_report):
     """A wrong column mapping must score strictly worse than the real one."""
     broken = _break_orders_primary_key(golden["schema"])
-    results = replay_corpus(golden["corpus"], broken, golden["tasks"], golden["tool_classes"])
+    results = replay_corpus(
+        golden["corpus"], broken, golden["tasks"], golden["tool_classes"], surface=golden["surface"]
+    )
     report = build_report(results)
     assert report.accepted is False
     assert report.overall_rate < golden_report.overall_rate
@@ -499,7 +527,7 @@ def test_render_shows_per_tool_rows_and_the_verdict(golden_report):
     for tool in GOLDEN_PER_TOOL:
         assert tool in text
     assert "overall" in text
-    assert "9/23" in text
+    assert "21/23" in text
 
 
 def test_render_says_accepted_when_it_is():
@@ -517,7 +545,7 @@ def test_to_json_round_trips_through_the_contract(golden_report):
         "mismatched": GOLDEN_REPLAYED - GOLDEN_MATCHED,
         "unsupported": 0,
     }
-    assert payload["per_tool_rates"]["get_order"] == pytest.approx(1 / 8)
+    assert payload["per_tool_rates"]["get_order"] == pytest.approx(7 / 8)
     revived = FidelityReport.model_validate_json(golden_report.model_dump_json())
     assert revived == golden_report
 
@@ -527,7 +555,11 @@ def test_to_json_round_trips_through_the_contract(golden_report):
 
 def test_per_trace_and_merged_reports_agree(golden):
     results = replay_corpus(
-        golden["corpus"], golden["schema"], golden["tasks"], golden["tool_classes"]
+        golden["corpus"],
+        golden["schema"],
+        golden["tasks"],
+        golden["tool_classes"],
+        surface=golden["surface"],
     )
     merged = build_report(results)
     per_trace = [build_report([r]) for r in results]
@@ -544,10 +576,16 @@ def test_replay_corpus_refuses_a_task_whose_trace_is_absent(golden):
 
 
 def test_static_entity_is_still_measured(golden_report):
-    """store_policy is a static snapshot. It is measured, not exempted."""
+    """store_policy is a static snapshot. It is measured, not exempted.
+
+    It now replays perfectly, but the point of this test is unchanged: a
+    structure we admit we could not infer is still held to the same standard as
+    everything else. Exempting it would let an environment score well by
+    modelling less.
+    """
     row = next(t for t in golden_report.per_tool if t.tool == "get_store_policy")
     assert row.replayed == 2
-    assert row.rate == 0.0
+    assert row.rate == 1.0
 
 
 def test_schema_entity_helper_is_untouched(golden):

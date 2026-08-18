@@ -37,6 +37,9 @@ from tracegym.contracts import (
     Observation,
     StateSchema,
     ToolClass,
+    ToolProfile,
+    ToolSurface,
+    WriteEffect,
 )
 
 from .interface import ReadOnlyEntityError, UnsupportedToolError
@@ -52,13 +55,34 @@ STATUS_COLUMN_NAMES = ("status", "state")
 
 @dataclass(frozen=True)
 class ReadRule:
-    """How one READ tool queries the store.
+    """How one READ tool queries the store, and what field set it returns.
 
     ``key_arg``/``key_column`` give the single-row lookup. ``filter_args`` map
     argument names onto columns for the list form. ``envelope`` is the response
-    key a list is wrapped in; ``projection`` narrows a list response to one
+    key a list is wrapped in; ``list_column`` narrows a *list* response to one
     column (e.g. ``order_ids``). ``None`` on any field means "infer at call
     time from the arguments actually passed".
+
+    ``projection`` is the response projection: the field set this tool was
+    OBSERVED to return, in the traces. A table is the union of every column any
+    tool ever exposed, so ``SELECT *`` returns strictly more than any single
+    tool did -- ``orders`` grows a ``refund_amount_cents`` column the moment
+    ``refund_order`` is profiled, and ``get_order`` would then answer with a
+    key production never sent. The projection is what keeps a read honest to
+    the tool, not to the table. It is derived from
+    ``ToolProfile.response_fields`` when a :class:`ToolSurface` is available,
+    and can be overridden here by a human exactly like the write rules can.
+
+    Fallback when ``projection`` is ``None`` (no surface supplied): NULL-valued
+    columns are omitted from the row. This is a strictly *weaker* heuristic and
+    is documented as such -- it is right only because a column a tool never
+    returned is usually a column that tool never populated. It is wrong for a
+    column that is legitimately NULL in production and *was* sent as ``null``:
+    that key gets dropped from the response even though the real tool emitted
+    it. It is also wrong in the other direction: once a write populates such a
+    column, the read starts emitting a key it never emitted before. Supply a
+    surface and get a real projection; the fallback only keeps the common case
+    from being obviously wrong.
     """
 
     tool: str
@@ -66,7 +90,8 @@ class ReadRule:
     key_arg: str | None = None
     key_column: str | None = None
     filter_args: Mapping[str, str] | None = None
-    projection: str | None = None
+    projection: tuple[str, ...] | None = None
+    list_column: str | None = None
     envelope: str | None = None
     error_kind: str = "not_found"
     inferred: bool = True
@@ -82,6 +107,10 @@ class WriteRule:
     * ``set_values``: columns set to a constant by the mere fact of calling this
       tool -- e.g. ``refund_order`` sets ``status='refunded'``. Inferred only
       when the value was actually *observed* in the schema's sample values.
+    * ``response_columns``: the exact response shape, as column names, when the
+      tool was observed echoing a specific field set back (from
+      ``WriteEffect.response_echoes``). ``None`` means "key plus whatever
+      changed", the old default.
     * ``response_echo``: response key -> argument name, for values the store
       does not hold (``amount_cents``) but the real tool echoed back.
     * ``conflict_error_kind``: error returned when the row already carries the
@@ -94,6 +123,7 @@ class WriteRule:
     key_column: str | None = None
     column_map: Mapping[str, str] | None = None
     set_values: Mapping[str, JsonValue] = field(default_factory=dict)
+    response_columns: tuple[str, ...] | None = None
     response_echo: Mapping[str, str] = field(default_factory=dict)
     conflict_error_kind: str | None = None
     not_found_error_kind: str = "not_found"
@@ -146,12 +176,28 @@ def _verb_forms(tool: str) -> set[str]:
 
 
 def infer_status_effect(tool: str, entity: EntitySchema) -> tuple[str, JsonValue] | None:
-    """Infer ``(column, value)`` a write tool sets, from its verb.
+    """LAST-RESORT ONLY. Guess ``(column, value)`` a write tool sets, from English.
 
-    ``refund_order`` -> the ``status`` column takes the value ``"refunded"`` --
-    but only because ``"refunded"`` was *observed* among that column's sample
-    values. We never invent a value the world has not shown us. Irregular verbs
-    (``cancel`` -> ``cancelled``) will not be inferred; override the rule.
+    .. warning::
+
+       This derives write semantics from the tool's *name*. It is not evidence,
+       it is a pun that happens to work in English: ``refund_order`` ->
+       ``status="refunded"`` only because the past participle of the verb
+       collides with an observed status value. It does not survive
+       ``cancel_order -> "cancelled"``, ``approve_return -> "authorized"``, a
+       non-English tool name, or a status vocabulary that does not echo the
+       verb -- and when it does fail it fails *silently*, by simply inferring
+       nothing, which then surfaces as an unsupported call much later.
+
+       The authoritative source is :class:`~tracegym.contracts.WriteEffect` on
+       the entity (``sets_constants``), collected from what the write was
+       actually observed to change. :func:`infer_rule` uses it whenever it is
+       present and only falls back here when ``write_effects`` is empty --
+       which today means "schema inference has not been re-run", not "this is
+       how we do it".
+
+    Even as a fallback it refuses to invent: the value must have been
+    *observed* among that column's sample values.
     """
     forms = _verb_forms(tool)
     for column in _status_columns(entity):
@@ -161,14 +207,81 @@ def infer_status_effect(tool: str, entity: EntitySchema) -> tuple[str, JsonValue
     return None
 
 
+def _profile(surface: ToolSurface | None, tool: str) -> ToolProfile | None:
+    return surface.by_name(tool) if surface is not None else None
+
+
+def observed_response_projection(surface: ToolSurface | None, tool: str) -> tuple[str, ...] | None:
+    """The field set ``tool`` was observed to return, from stage 2's profile.
+
+    Only top-level scalar/object keys are kept: profilers record nested paths
+    (``order_ids[]``, ``a.b``) as their own entries, and those are shapes inside
+    a value, not keys of the response object.
+
+    Returns ``None`` when there is no surface, no profile, or no observed
+    response at all -- "we do not know" is never the same as "empty".
+    """
+    profile = _profile(surface, tool)
+    if profile is None:
+        return None
+    names = tuple(
+        f.name for f in profile.response_fields if "[" not in f.name and "." not in f.name
+    )
+    return names or None
+
+
+def _write_effect(entity: EntitySchema, tool: str) -> WriteEffect | None:
+    for effect in entity.write_effects:
+        if effect.tool == tool:
+            return effect
+    return None
+
+
+def _rule_from_write_effect(entity: EntitySchema, effect: WriteEffect) -> WriteRule:
+    """Build a :class:`WriteRule` from observed evidence. No English involved.
+
+    ``argument_columns`` only records the arguments whose name *differs* from
+    the column, so the identity mapping (``update_order_status(status=...)`` ->
+    ``orders.status``) is added here for every column of the entity. Entries for
+    arguments the caller does not pass are ignored at call time, so a superset
+    is harmless and keeps the runtime's mapping strictly explicit.
+    """
+    column_map: dict[str, str] = {f.name: f.name for f in entity.fields}
+    column_map.update(effect.argument_columns)
+    set_values = dict(effect.sets_constants)
+    conflict: str | None = None
+    for value in set_values.values():
+        if isinstance(value, str):
+            conflict = f"already_{value}"
+            break
+    return WriteRule(
+        tool=effect.tool,
+        entity=entity.name,
+        key_arg=effect.key_argument,
+        key_column=entity.primary_key,
+        column_map=column_map,
+        set_values=set_values,
+        response_columns=effect.response_echoes or None,
+        conflict_error_kind=conflict,
+    )
+
+
 def infer_rule(
     schema: StateSchema,
     tool: str,
     tool_class: ToolClass,
     *,
     external_stub: JsonValue | None = None,
+    surface: ToolSurface | None = None,
 ) -> Rule:
-    """Derive the rule for one tool, or an :class:`Unsupported` with a reason."""
+    """Derive the rule for one tool, or an :class:`Unsupported` with a reason.
+
+    ``surface`` (stage 2) is the evidence for what a READ tool returns; without
+    it reads fall back to the weaker null-omission heuristic documented on
+    :class:`ReadRule`. Write semantics come from
+    :attr:`EntitySchema.write_effects` when present, and only otherwise from the
+    last-resort verb guess in :func:`infer_status_effect`.
+    """
     if tool_class is ToolClass.UNKNOWN:
         return Unsupported(tool, "tool class is UNKNOWN; not enough evidence to reimplement it")
 
@@ -192,7 +305,12 @@ def infer_rule(
     entity = candidates[0]
 
     if tool_class is ToolClass.READ:
-        return ReadRule(tool=tool, entity=entity.name, key_column=entity.primary_key)
+        return ReadRule(
+            tool=tool,
+            entity=entity.name,
+            key_column=entity.primary_key,
+            projection=observed_response_projection(surface, tool),
+        )
 
     if entity.static_snapshot:
         return Unsupported(
@@ -203,6 +321,13 @@ def infer_rule(
         return Unsupported(
             tool, f"entity {entity.name!r} has no primary key, so the target row is undecidable"
         )
+    observed = _write_effect(entity, tool)
+    if observed is not None:
+        # Authoritative: what this tool was actually seen to do.
+        return _rule_from_write_effect(entity, observed)
+
+    # Fallback only. See the warning on infer_status_effect: this reads the
+    # tool's English name because nothing recorded what it did.
     effect = infer_status_effect(tool, entity)
     set_values: dict[str, JsonValue] = {}
     conflict: str | None = None
@@ -234,11 +359,13 @@ class ToolRuntime:
         *,
         rules: Mapping[str, Rule] | None = None,
         external_stubs: Mapping[str, JsonValue] | None = None,
+        surface: ToolSurface | None = None,
     ) -> None:
         self.schema = schema
         self.tool_classes = dict(tool_classes)
         self.store = store
         self.ledger = ledger
+        self.surface = surface
         self.external_stubs = dict(external_stubs or {})
         overrides = dict(rules or {})
         self.rules: dict[str, Rule] = {}
@@ -247,7 +374,11 @@ class ToolRuntime:
                 self.rules[tool] = overrides[tool]
                 continue
             self.rules[tool] = infer_rule(
-                schema, tool, klass, external_stub=self.external_stubs.get(tool)
+                schema,
+                tool,
+                klass,
+                external_stub=self.external_stubs.get(tool),
+                surface=surface,
             )
         # An override may name a tool absent from the class map. Honour it.
         for tool, rule in overrides.items():
@@ -304,7 +435,7 @@ class ToolRuntime:
                     status=CallStatus.ERROR,
                     error_kind=rule.error_kind,
                 )
-            return Observation(response=row, status=CallStatus.OK)
+            return Observation(response=self._project(rule, row), status=CallStatus.OK)
 
         # List form: every argument that names a column becomes a filter.
         if rule.filter_args is not None:
@@ -320,17 +451,52 @@ class ToolRuntime:
                 "supply a ReadRule with an explicit key_arg or filter_args",
             )
         rows = self.store.find_many(entity, filters)
-        projection = rule.projection
-        if projection is None and key_column:
+        list_column = rule.list_column
+        if list_column is None and key_column and not self._returns_rows(rule):
             # An id-list response is the common shape; derive its key from the
             # primary key: order_id -> order_ids.
-            projection = key_column
-        envelope = rule.envelope or (f"{projection}s" if projection else f"{entity}")
-        if projection and all(projection in r for r in rows):
-            payload: JsonValue = [r[projection] for r in rows]
+            list_column = key_column
+        envelope = rule.envelope or (f"{list_column}s" if list_column else f"{entity}")
+        if list_column and all(list_column in r for r in rows):
+            payload: JsonValue = [r[list_column] for r in rows]
         else:
-            payload = rows
+            payload = [self._project(rule, r) for r in rows]
         return Observation(response={envelope: payload}, status=CallStatus.OK)
+
+    def _returns_rows(self, rule: ReadRule) -> bool:
+        """True when the projection says this list read returns rows, not bare ids.
+
+        ``search_orders`` was observed returning ``{"order_ids": [...]}``: its
+        projected names are not columns of the entity, so the id-list shape
+        stands. A projection that *does* name columns is positive evidence of a
+        row-shaped response, and collapsing it to ids would contradict it.
+        """
+        if rule.projection is None:
+            return False
+        return any(self.store.has_column(rule.entity, name) for name in rule.projection)
+
+    def _project(self, rule: ReadRule, row: JsonObject) -> JsonObject:
+        """Narrow a stored row to the field set this tool actually returns.
+
+        With a projection (evidence: ``ToolProfile.response_fields``) the row is
+        cut to exactly those keys, intersected with the keys the row has -- a
+        projected field the store does not hold is not invented as ``null``.
+
+        Without one, fall back to dropping NULL columns. That fallback is a
+        heuristic and a weaker one: see :class:`ReadRule` for why a legitimately
+        null production field defeats it. It is applied only because the
+        alternative -- returning the union of every column any tool ever
+        exposed -- is wrong more often.
+        """
+        if rule.projection is not None:
+            keep = [k for k in rule.projection if k in row]
+            if keep:
+                return {k: row[k] for k in keep}
+            # A projection that matches nothing describes a different response
+            # shape (an envelope, say), not an empty row. Leave the row alone
+            # rather than answering with {}.
+            return dict(row)
+        return {k: v for k, v in row.items() if v is not None}
 
     def _read_static(self, entity: str) -> Observation:
         """Static entities are returned exactly as observed. No structure invented."""
@@ -410,6 +576,17 @@ class ToolRuntime:
         assert updated is not None  # matched a moment ago, single-threaded session
         if rule.respond_with_row:
             response: JsonObject = dict(updated)
+        elif rule.response_columns is not None:
+            # The observed response shape (WriteEffect.response_echoes), in the
+            # observed order. A name that is not a column of the row falls back
+            # to the argument of the same name; anything else is left out rather
+            # than fabricated.
+            response = {}
+            for column in rule.response_columns:
+                if column in updated:
+                    response[column] = updated[column]
+                elif column in arguments:
+                    response[column] = arguments[column]
         else:
             response = {key_arg: updated[key_column]}
             for column in values:
@@ -429,4 +606,5 @@ __all__ = [
     "WriteRule",
     "infer_rule",
     "infer_status_effect",
+    "observed_response_projection",
 ]

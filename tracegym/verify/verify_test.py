@@ -34,6 +34,11 @@ from tracegym.verify.synthesize import UnlabeledTraceError, synthesize_verifier
 ADA = customer(88, "Ada Lovelace", "ada@example.com", "gold")
 ORDER_PRE = order(7741, 88, "SKU-RED-9", "delivered", 4200, "2026-07-02")
 ORDER_POST = order(7741, 88, "SKU-RED-9", "refunded", 4200, "2026-07-02")
+#: ep-refund-ok's search_orders names 7742 but never reads it, so the task seeds
+#: it as a PARTIAL row: key plus the query's own customer_id filter, and nothing
+#: else. The materialized env therefore contains it, with every other column
+#: unset - which is what these hand-built final states have to model.
+ORDER_7742_PARTIAL = {"order_id": 7742, "customer_id": 88}
 RED = product("SKU-RED-9", "Red Widget", 4200, True)
 
 TOOL_CLASSES = {
@@ -63,10 +68,12 @@ def refund_verifier(reviewed: bool = True) -> Verifier:
     return v.model_copy(update={"reviewed_by": "a-human"}) if reviewed else v
 
 
-def final_state(order_row=None, customers=None, products=None):
+def final_state(order_row=None, customers=None, products=None, orders=None):
     return {
         "customers": customers if customers is not None else [ADA],
-        "orders": [order_row if order_row is not None else ORDER_POST],
+        "orders": orders
+        if orders is not None
+        else [order_row if order_row is not None else ORDER_POST, ORDER_7742_PARTIAL],
         "products": products if products is not None else [RED],
     }
 
@@ -85,7 +92,11 @@ def record(actions=HONEST_ACTIONS, **kw) -> RolloutRecord:
         task_id="task-ep-refund-ok",
         actions=actions,
         manifest=MANIFEST,
-        pre_state={"customers": [ADA], "orders": [ORDER_PRE], "products": [RED]},
+        pre_state={
+            "customers": [ADA],
+            "orders": [ORDER_PRE, ORDER_7742_PARTIAL],
+            "products": [RED],
+        },
         final_state=final_state(),
         primary_keys={"customers": "customer_id", "orders": "order_id", "products": "sku"},
         resource_reads=(),
@@ -221,7 +232,7 @@ def test_partial_credit_and_all_or_nothing_differ():
     loose = evaluate(v, final_state(), [], mode="partial")
     assert strict.reward == 0.0
     assert 0.0 < loose.reward < 1.0
-    assert loose.reward == pytest.approx(3 / 4)
+    assert loose.reward == pytest.approx(4 / 5)
     assert strict.passed is loose.passed is False
 
 
@@ -356,3 +367,82 @@ def test_report_serializes_for_a_human():
     assert blob["clean"] is False
     assert blob["findings"][0]["guard"] == "direct_store_write"
     assert "mutations" in blob["findings"][0]["evidence"]
+
+
+# --------------------------------------------------------------------------
+# partial pre-state rows must not corrupt synthesis
+# --------------------------------------------------------------------------
+
+
+def test_partial_row_yields_a_narrow_assertion_over_known_fields_only():
+    """ep-refund-ok names order 7742 in an id list and never reads it. The
+    verifier may assert what production stated - the row exists, and it matches
+    the customer_id the search filtered on - and nothing else. If it asserted on
+    the unread columns it would be asserting on a guess, and every honest
+    rollout would fail."""
+    v = refund_verifier()
+    a = next(a for a in v.assertions if a.row_key == {"order_id": 7742})
+    assert a.kind is AssertionKind.STATE_UNCHANGED
+    assert a.expected == ORDER_7742_PARTIAL
+    assert "sku" not in a.expected and "status" not in a.expected
+    # the reviewer is told, in the description, that this row was never read
+    assert "partial pre-state row" in a.description
+
+
+def test_partial_row_passes_when_the_env_leaves_its_unknown_columns_unset():
+    """The materialized store seeds the key and the implied filter and leaves
+    every other column NULL. That must grade as unchanged, not as damage."""
+    v = refund_verifier()
+    seeded = {"order_id": 7742, "customer_id": 88, "sku": None, "status": None,
+              "total_cents": None, "placed_at": None}
+    assert evaluate(v, final_state(orders=[ORDER_POST, seeded]),
+                    [Effect(tool="send_email")]).passed
+
+
+def test_partial_row_still_catches_collateral_damage():
+    """Not knowing a row's contents is not a licence to delete or re-key it."""
+    v = refund_verifier()
+    deleted = evaluate(v, final_state(orders=[ORDER_POST]), [Effect(tool="send_email")])
+    assert not deleted.passed
+    assert [x.assertion.row_key for x in deleted.results if not x.passed] == [{"order_id": 7742}]
+
+    rekeyed = evaluate(
+        v,
+        final_state(orders=[ORDER_POST, dict(ORDER_7742_PARTIAL, customer_id=91)]),
+        [Effect(tool="send_email")],
+    )
+    assert not rekeyed.passed
+    bad = next(x for x in rekeyed.results if not x.passed)
+    assert bad.actual == {"customer_id": 91}
+
+
+def test_entity_wide_state_unchanged_tolerates_partial_rows():
+    """When the episode changed nothing in an entity, synthesis collapses to one
+    entity-level STATE_UNCHANGED whose expected rows are matched as subsets. A
+    partial row must satisfy it against a fully materialized store row."""
+    browsing = make_trace(
+        "ep-browse-orders",
+        "Which orders does customer 88 have?",
+        [
+            ("get_customer", {"customer_id": 88}, ADA),
+            ("search_orders", {"customer_id": 88}, {"order_ids": [7741, 7742]}),
+        ],
+        "You have two orders.",
+        True,
+    )
+    task, _, _ = mine_task(browsing, RETAIL_SCHEMA)
+    assert task is not None
+    assert task.provenance["partial_pre_state_rows"] == {"orders": (7741, 7742)}
+    v = synthesize_verifier(task, browsing, RETAIL_SCHEMA).model_copy(
+        update={"reviewed_by": "a-human"}
+    )
+    orders_assertion = next(a for a in v.assertions if a.entity == "orders")
+    assert orders_assertion.kind is AssertionKind.STATE_UNCHANGED
+    assert orders_assertion.row_key is None
+    assert "partial pre-state row" in orders_assertion.description
+
+    full = {"customers": [ADA], "products": [RED],
+            "orders": [ORDER_PRE, order(7742, 88, "SKU-YEL-7", "in_transit", 999, "2026-07-05")]}
+    assert evaluate(v, full).passed
+    wiped = {"customers": [ADA], "products": [RED], "orders": []}
+    assert not evaluate(v, wiped).passed

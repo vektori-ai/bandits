@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import pytest
 
-from tracegym.contracts import StateSchema
+from tracegym.contracts import StateSchema, ToolClass, ToolProfile, ToolSurface
+from tracegym.ingest import load_corpus_and_registry
 from tracegym.state import infer_schema
 from tracegym.state._fixtures import (
+    FIXTURE_DIR,
     corpus_from_calls,
     expected,
     golden_corpus,
@@ -32,6 +34,8 @@ from tracegym.state.entities import (
 )
 from tracegym.state.identifiers import find_identifiers, is_identifier_scalar
 from tracegym.state.relations import infer_foreign_keys
+from tracegym.state.writes import NO_DIFF_CONFIDENCE
+from tracegym.surface import build_surface
 
 # --------------------------------------------------------------------------
 # fixtures
@@ -482,3 +486,235 @@ def test_foreign_key_evidence_is_returned_for_review(corpus):
     assert ("orders", "customer_id", "customers") in considered
     # every emitted key must have a matching evidence record
     assert any(e.rule == "FK-1" and e.matched_distinct > 0 for e in evidence)
+
+
+# --------------------------------------------------------------------------
+# write effects - what a write tool actually writes
+# --------------------------------------------------------------------------
+
+
+def _surface(**classes) -> ToolSurface:
+    """A minimal ToolSurface for synthetic corpora: ``_surface(refund_order="write")``."""
+    return ToolSurface(
+        tools=tuple(
+            ToolProfile(name=name, tool_class=ToolClass(value), class_confidence=1.0)
+            for name, value in sorted(classes.items())
+        )
+    )
+
+
+def _effect(entity, tool):
+    for w in entity.write_effects:
+        if w.tool == tool:
+            return w
+    raise AssertionError(f"no WriteEffect for {tool!r} on {entity.name!r}: {entity.write_effects}")
+
+
+@pytest.mark.parametrize("with_surface", [True, False])
+def test_every_writer_has_a_write_effect(corpus, surface, with_surface):
+    """``write_effects`` covers exactly ``written_by``, so a missing one is a bug."""
+    schema = infer_schema(corpus, surface if with_surface else None)
+    for entity in schema.entities:
+        assert {w.tool for w in entity.write_effects} == set(entity.written_by)
+
+
+@pytest.mark.parametrize("with_surface", [True, False])
+def test_refund_order_write_effect_is_fully_inferred(corpus, surface, with_surface):
+    """The whole point: ``refunded`` comes from the observed diff, not from the verb."""
+    schema = infer_schema(corpus, surface if with_surface else None)
+    effect = _effect(schema.entity("orders"), "refund_order")
+
+    assert effect.key_argument == "order_id"
+    assert effect.sets_constants == {"status": "refunded"}
+    assert effect.argument_columns == {"amount_cents": "refund_amount_cents"}
+    assert set(effect.response_echoes) >= {"order_id", "status", "refund_amount_cents"}
+    assert effect.evidence_count == 3
+    assert 0.0 < effect.confidence < 1.0
+    assert effect.evidence
+
+
+def test_update_order_status_sets_no_constant_because_status_comes_from_an_argument(schema):
+    """``update_order_status`` is a writer, but its status is *not* a constant.
+
+    The corpus calls it exactly once, with ``status="delivered"``, and the
+    column ends up ``"delivered"``. A count-based rule would happily report
+    ``sets_constants == {"status": "delivered"}`` - and the rebuilt environment
+    would then mark every order delivered whatever the agent asked for.
+
+    The column's value equalled a *supplied argument* on every call, so it is
+    argument-driven, and we publish nothing. ``argument_columns`` is also empty:
+    the contract only records mappings where the argument and column names
+    differ, and here both are ``status``, which needs no map. The identity
+    mapping is recorded in ``evidence`` for the reviewer.
+    """
+    effect = _effect(schema.entity("orders"), "update_order_status")
+
+    assert effect.key_argument == "order_id"
+    assert effect.sets_constants == {}
+    assert effect.argument_columns == {}
+    assert set(effect.response_echoes) == {"order_id", "status"}
+    assert effect.evidence_count == 1
+    assert any("argument-driven" in line for line in effect.evidence)
+    assert any("'status' -> column 'status'" in line for line in effect.evidence)
+
+
+def test_a_column_with_a_different_value_per_call_is_not_a_constant():
+    """Unanimity or nothing: a varying column is omitted, never reported by majority."""
+    corpus = corpus_from_calls(
+        {
+            "t1": [
+                ("get_ticket", {"ticket_id": 1}, {"ticket_id": 1, "state": "open", "owner": "ann"}),
+                (
+                    "assign_ticket",
+                    {"ticket_id": 1, "owner": "bob"},
+                    {"ticket_id": 1, "state": "assigned", "owner": "bob", "queue": "support"},
+                ),
+            ],
+            "t2": [
+                ("get_ticket", {"ticket_id": 2}, {"ticket_id": 2, "state": "open", "owner": "ann"}),
+                (
+                    "assign_ticket",
+                    {"ticket_id": 2, "owner": "cat"},
+                    {"ticket_id": 2, "state": "escalated", "owner": "cat", "queue": "support"},
+                ),
+            ],
+        }
+    )
+    effect = _effect(infer_schema(corpus).entity("tickets"), "assign_ticket")
+
+    # 'state' changed on every call but to a different value each time.
+    assert "state" not in effect.sets_constants
+    # 'owner' changed on every call, to the value the caller supplied.
+    assert "owner" not in effect.sets_constants
+    # 'queue' is the real constant, and the rule still finds it.
+    assert effect.sets_constants == {"queue": "support"}
+    assert any("not a constant" in line for line in effect.evidence)
+
+
+def test_an_errored_write_contributes_no_evidence():
+    """The failed call changed nothing, so it must not diff, count, or echo."""
+    corpus = corpus_from_calls(
+        {
+            "t1": [
+                ("get_ticket", {"ticket_id": 1}, {"ticket_id": 1, "state": "open"}),
+                ("close_ticket", {"ticket_id": 1}, {"ticket_id": 1, "state": "closed"}),
+            ],
+            "t2": [
+                ("get_ticket", {"ticket_id": 2}, {"ticket_id": 2, "state": "open"}),
+                (
+                    "close_ticket",
+                    {"ticket_id": 2},
+                    {"error": "forbidden", "ticket_id": 2, "state": "open"},
+                    "error",
+                ),
+            ],
+        }
+    )
+    effect = _effect(infer_schema(corpus).entity("tickets"), "close_ticket")
+
+    assert effect.evidence_count == 1
+    # Had the error counted, 'state' would have been open on one call and
+    # closed on the other, and the constant would have vanished.
+    assert effect.sets_constants == {"state": "closed"}
+    assert "error" not in effect.response_echoes
+
+
+def test_write_effect_without_a_diff_is_capped_and_says_so():
+    """A write that is the first sighting of its row rests on its own response only.
+
+    Needs a surface: with no prior observation there is no diff, so
+    ``infer_writers`` cannot see the write at all - which is exactly why the
+    confidence is capped.
+    """
+    corpus = corpus_from_calls(
+        {
+            "t1": [
+                (
+                    "assign_ticket",
+                    {"ticket_id": 1, "owner": "bob"},
+                    {"ticket_id": 1, "owner": "bob", "queue": "support"},
+                ),
+                ("get_ticket", {"ticket_id": 1}, {"ticket_id": 1, "owner": "bob", "state": "open"}),
+            ],
+        }
+    )
+    schema = infer_schema(corpus, _surface(assign_ticket="write", get_ticket="read"))
+    effect = _effect(schema.entity("tickets"), "assign_ticket")
+
+    assert effect.confidence <= NO_DIFF_CONFIDENCE
+    # 'state' came from the following read, not from the write, so it is not
+    # claimed as something assign_ticket set.
+    assert "state" not in effect.sets_constants
+
+
+def test_argument_column_mapping_needs_a_value_match_not_a_name_match():
+    """Similar names alone prove nothing: no value match, no mapping."""
+    corpus = corpus_from_calls(
+        {
+            "t1": [
+                ("get_ticket", {"ticket_id": 1}, {"ticket_id": 1, "owner_name": "ann"}),
+                (
+                    "assign_ticket",
+                    {"ticket_id": 1, "owner": "bob"},
+                    {"ticket_id": 1, "owner_name": "robert"},
+                ),
+            ],
+            "t2": [
+                ("get_ticket", {"ticket_id": 2}, {"ticket_id": 2, "owner_name": "ann"}),
+                (
+                    "assign_ticket",
+                    {"ticket_id": 2, "owner": "cat"},
+                    {"ticket_id": 2, "owner_name": "catherine"},
+                ),
+            ],
+        }
+    )
+    effect = _effect(infer_schema(corpus).entity("tickets"), "assign_ticket")
+
+    assert effect.argument_columns == {}
+
+
+# --------------------------------------------------------------------------
+# the real pipeline - stage 1 -> stage 2 -> stage 3, no hand-built fixtures
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def pipeline_schema() -> StateSchema:
+    """Schema built from the on-disk OTLP export through ingest and surface.
+
+    Everything above this point feeds :mod:`tracegym.state` corpora it built
+    itself. This fixture is the only one that proves the inference survives real
+    upstream output - argument JSON that went through a span attribute, tool
+    classes decided by stage 2's classifier rather than asserted by a fixture.
+    """
+    corpus, registry = load_corpus_and_registry(
+        FIXTURE_DIR / "traces.otlp.jsonl",
+        source="otlp",
+        tools_path=FIXTURE_DIR / "tools.json",
+    )
+    return infer_schema(corpus, build_surface(corpus, registry))
+
+
+def test_pipeline_refund_order_write_effect(pipeline_schema):
+    orders = pipeline_schema.entity("orders")
+    assert orders is not None
+    effect = _effect(orders, "refund_order")
+
+    assert effect.key_argument == "order_id"
+    assert effect.sets_constants == {"status": "refunded"}
+    assert effect.argument_columns == {"amount_cents": "refund_amount_cents"}
+    assert set(effect.response_echoes) >= {"order_id", "status", "refund_amount_cents"}
+    assert effect.evidence_count == 3
+
+
+def test_pipeline_update_order_status_write_effect(pipeline_schema):
+    effect = _effect(pipeline_schema.entity("orders"), "update_order_status")
+    assert effect.key_argument == "order_id"
+    assert effect.sets_constants == {}
+    assert effect.evidence_count == 1
+
+
+def test_pipeline_write_effects_cover_written_by(pipeline_schema):
+    for entity in pipeline_schema.entities:
+        assert {w.tool for w in entity.write_effects} == set(entity.written_by)
