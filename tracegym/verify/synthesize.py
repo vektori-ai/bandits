@@ -166,6 +166,11 @@ def synthesize_verifier(
         row_assertions: list[Assertion] = []
 
         for key_id, post in post_idx.items():
+            if (entity.name, key_id) in deleted:
+                # A later read reported this row missing. Absence wins over any
+                # earlier write response, and the two must never both be
+                # asserted - a verifier that contradicts itself can never pass.
+                continue
             pre = pre_idx.get(key_id)
             key_value = post.get(pk)
             rk = row_key_for(pk, key_value)
