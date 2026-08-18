@@ -207,6 +207,42 @@ class ForeignKey(Contract):
     confidence: float = 0.0
 
 
+class WriteEffect(Contract):
+    """What a write tool was observed to change on an entity.
+
+    This is evidence collected at schema-inference time and carried forward, so
+    the environment runtime never has to re-derive a write's semantics from the
+    tool's English name. Guessing ``refund_order -> "refunded"`` from the verb
+    works until it meets ``cancel_order -> "cancelled"`` or
+    ``approve_return -> "authorized"``.
+    """
+
+    tool: str
+    key_argument: str | None = None
+    """Which argument identifies the row being written."""
+
+    argument_columns: dict[str, str] = Field(default_factory=dict)
+    """Argument name -> column name, where the two differ.
+
+    e.g. ``refund_order(amount_cents=...)`` sets ``orders.refund_amount_cents``.
+    """
+
+    sets_constants: JsonObject = Field(default_factory=dict)
+    """Column -> constant value this tool was observed to set every time.
+
+    e.g. ``{"status": "refunded"}``. Only populated when the value was actually
+    observed, never inferred from the tool name.
+    """
+
+    response_echoes: tuple[str, ...] = ()
+    """Columns the tool's own response echoes back to the caller."""
+
+    evidence_count: int = 0
+    confidence: float = 0.0
+    evidence: tuple[str, ...] = ()
+    """Human-readable justification. A reviewer reads these."""
+
+
 class EntitySchema(Contract):
     """One inferred table behind the tool responses."""
 
@@ -216,6 +252,9 @@ class EntitySchema(Contract):
     foreign_keys: tuple[ForeignKey, ...] = ()
     written_by: tuple[str, ...] = ()
     read_by: tuple[str, ...] = ()
+    write_effects: tuple[WriteEffect, ...] = ()
+    """Observed semantics of each writing tool. See WriteEffect."""
+
     evidence_count: int = 0
     static_snapshot: bool = False
     """True when the entity is only ever read and never cross-referenced.
@@ -413,4 +452,5 @@ __all__ = [
     "TraceCorpus",
     "VerificationResult",
     "Verifier",
+    "WriteEffect",
 ]
