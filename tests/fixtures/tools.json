@@ -1,0 +1,155 @@
+[
+  {
+    "name": "get_customer",
+    "description": "Fetch a customer by id.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "customer_id": {
+          "type": "integer"
+        },
+        "include_orders": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "customer_id"
+      ]
+    }
+  },
+  {
+    "name": "search_orders",
+    "description": "List order ids for a customer.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "customer_id": {
+          "type": "integer"
+        },
+        "status": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "customer_id"
+      ]
+    }
+  },
+  {
+    "name": "get_order",
+    "description": "Fetch one order by id.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "order_id": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "order_id"
+      ]
+    }
+  },
+  {
+    "name": "refund_order",
+    "description": "Refund an order.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "order_id": {
+          "type": "integer"
+        },
+        "amount_cents": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "order_id",
+        "amount_cents"
+      ]
+    }
+  },
+  {
+    "name": "update_order_status",
+    "description": "Set an order status.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "order_id": {
+          "type": "integer"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "order_id",
+        "status"
+      ]
+    }
+  },
+  {
+    "name": "get_product",
+    "description": "Fetch a product by sku.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "sku": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sku"
+      ]
+    }
+  },
+  {
+    "name": "get_store_policy",
+    "description": "Return the current store refund policy text.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "send_email",
+    "description": "Send an email to a customer. Irreversible.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "to_customer_id": {
+          "type": "integer"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "to_customer_id",
+        "subject",
+        "body"
+      ]
+    }
+  },
+  {
+    "name": "escalate_to_human",
+    "description": "Hand off to a human agent. Never called in this corpus.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ]
+    }
+  }
+]
