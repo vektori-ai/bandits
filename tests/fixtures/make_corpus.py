@@ -280,7 +280,7 @@ def to_otlp(eps):
                 "tracegym.outcome": outcome,
             },
         }]
-        for si, (tool, args, resp, status, err) in enumerate(calls):
+        for si, (tool, args, resp, status, _err) in enumerate(calls):
             spans.append({
                 "traceId": tid,
                 "spanId": f"{ti:08x}{si + 1:04x}",
@@ -313,7 +313,7 @@ def to_chat(eps):
             {"role": "system", "content": "You are a retail support agent."},
             {"role": "user", "content": instruction},
         ]
-        for si, (tool, args, resp, status, err) in enumerate(calls):
+        for si, (tool, args, resp, _status, _err) in enumerate(calls):
             cid = f"call_{eid}_{si}"
             msgs.append({
                 "role": "assistant",
