@@ -10,3 +10,6 @@ build/
 htmlcov/
 out/
 *.db
+.env
+.bandits/
+work/
