@@ -6,6 +6,7 @@ from bandits.verify.draft import (
     load_verifier_draft,
     save_verifier_draft,
 )
+from bandits.verify.execute import execute_verifier
 from bandits.verify.interview import (
     answer_question,
     compute_interview_id,
@@ -44,6 +45,7 @@ __all__ = [
     "compute_interview_id",
     "answer_question",
     "draft_verifiers",
+    "execute_verifier",
     "load_verifier_draft",
     "load_interview",
     "next_question",

@@ -24,6 +24,7 @@ def _draft() -> VerifierDraft:
         family_id="family-one",
         task_set_id="taskset-one",
         mode=VerifierMode.REPLAY,
+        status=VerifierStatus.EXECUTABLE,
         inputs=("terminal_evidence:final_state_field:status",),
         checks=(
             CheckSpec(
@@ -72,7 +73,7 @@ def test_revision_changes_only_the_answer_target() -> None:
     assert after.checks[0].expected == "completed"
     assert after.blind_spots == before.blind_spots
     assert after.gaming_hypotheses == before.gaming_hypotheses
-    assert after.status is VerifierStatus.SUGGESTED
+    assert after.status is VerifierStatus.EXECUTABLE
 
 
 def test_completed_interview_refuses_extra_answers() -> None:

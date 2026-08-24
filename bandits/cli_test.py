@@ -206,7 +206,7 @@ def test_draft_verifier_writes_suggested_replay_specs(tmp_path) -> None:
     draft_id = result.stdout.split()[1]
     draft = load_verifier_draft(draft_id, store)
     assert draft.verifiers
-    assert all(spec.status.value == "suggested" for spec in draft.verifiers)
+    assert all(spec.status.value == "executable" for spec in draft.verifiers)
     assert all(spec.mode.value == "replay" for spec in draft.verifiers)
 
 
@@ -263,4 +263,31 @@ def test_interview_verifier_completes_a_bounded_review(tmp_path) -> None:
     interview = load_interview(interview_id, store)
     assert interview.complete
     assert len(interview.answers) == 3
-    assert interview.draft.verifiers[0].status.value == "suggested"
+    assert interview.draft.verifiers[0].status.value == "executable"
+
+
+def test_draft_verifier_can_run_the_interview_inline(tmp_path) -> None:
+    task_set_id = _mined(tmp_path)
+    store = DerivedStore(tmp_path / ".bandits")
+    family = next(
+        item for item in load_task_set(task_set_id, store).families if "refund" in item.descriptor
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "draft-verifier",
+            task_set_id,
+            "--family",
+            family.family_id,
+            "--interview",
+            "--project",
+            str(tmp_path),
+        ],
+        input="\n\n\n",
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "verifier_draft_id:" in result.stdout
+    assert "interview_id:" in result.stdout
+    assert "status:       complete" in result.stdout
