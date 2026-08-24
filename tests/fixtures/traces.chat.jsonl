@@ -1,0 +1,6 @@
+[
+  {"role": "user", "content": "Refund order 7741"},
+  {"role": "assistant", "content": null, "tool_calls": [{"id": "call-1", "function": {"name": "lookup_order", "arguments": "{\"order_id\": \"7741\"}"}}]},
+  {"role": "tool", "tool_call_id": "call-1", "name": "lookup_order", "content": "{\"status\": \"refunded\"}"},
+  {"role": "assistant", "content": "Order 7741 has been refunded."}
+]
