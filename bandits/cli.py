@@ -25,7 +25,15 @@ from bandits.analyze import (
 from bandits.ingest import CANONICAL_SOURCES, UnknownSourceError, load_corpus
 from bandits.redact import DEFAULT_RULESET, ruleset_by_name
 from bandits.store import ArtifactStore, DerivedStore
-from bandits.verify import draft_verifiers, save_verifier_draft
+from bandits.verify import (
+    answer_question,
+    draft_verifiers,
+    load_verifier_draft,
+    next_question,
+    save_interview,
+    save_verifier_draft,
+    start_interview,
+)
 
 app = typer.Typer(add_completion=False)
 console = Console()
@@ -354,6 +362,35 @@ def draft_verifier_command(
     console.print(table)
     for unresolved in draft.unresolved:
         console.print(f"[yellow]unresolved:[/yellow] {unresolved}")
+
+
+@app.command(name="interview-verifier")
+def interview_verifier_command(
+    verifier_draft_id: str,
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Review a verifier draft through a bounded, one-question-at-a-time interview."""
+    store = _derived(project)
+    try:
+        draft = load_verifier_draft(verifier_draft_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no verifier draft {verifier_draft_id!r}")
+        raise typer.Exit(code=1) from exc
+
+    interview = start_interview(draft, verifier_draft_id)
+    while (question := next_question(interview)) is not None:
+        console.print(f"\n[bold]{question.prompt}[/bold]")
+        answer = typer.prompt("Answer", default="", show_default=False)
+        interview = answer_question(interview, answer)
+
+    envelope = save_interview(interview, store)
+    console.print(f"interview_id: {envelope.artifact_id}")
+    console.print(f"questions:    {len(interview.questions)}")
+    console.print("status:       complete")
+    console.print(
+        "[yellow]note:[/yellow] review refined the hypothesis; validation is still required "
+        "before calibrated or reviewed status"
+    )
 
 
 if __name__ == "__main__":
