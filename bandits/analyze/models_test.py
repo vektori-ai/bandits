@@ -3,7 +3,9 @@ from __future__ import annotations
 import pytest
 
 from bandits.analyze.models import (
+    CorpusAnalysis,
     Evidence,
+    EvidenceKind,
     LeakageError,
     Visibility,
     build_task_candidate,
@@ -62,3 +64,41 @@ def test_strength_ranks_order_conflicting_evidence() -> None:
     strong = _evidence(Visibility.TERMINAL).model_copy(update={"strength": "strong"})
     weak = _evidence(Visibility.TERMINAL).model_copy(update={"strength": "weak"})
     assert strong.strength_rank > weak.strength_rank
+
+
+def test_evidence_kind_dominates_strength_when_resolving_conflicts() -> None:
+    live = _evidence(Visibility.POST_HOC).model_copy(
+        update={"kind": EvidenceKind.LIVE_QUERY, "strength": "weak"}
+    )
+    self_report = _evidence(Visibility.TERMINAL).model_copy(
+        update={"kind": EvidenceKind.AGENT_SELF_REPORT, "strength": "strong"}
+    )
+    assert live.trust_rank > self_report.trust_rank
+
+
+def test_analysis_rejects_dangling_evidence_reference() -> None:
+    task = build_task_candidate(
+        task_id="task-trace-1",
+        trace_id="trace-1",
+        instruction="Refund it",
+        prompt_evidence=(_evidence(Visibility.AT_START),),
+        trajectory_span_ids=(),
+        terminal_span_ids=(),
+        outcome_evidence=(),
+    )
+    with pytest.raises(ValueError, match="references missing evidence"):
+        CorpusAnalysis(corpus_id="corpus-1", source="test", tasks=(task,), evidence=())
+
+
+def test_agent_self_report_is_the_floor() -> None:
+    """Nothing may outrank-by-default what the agent says about its own run."""
+    self_report = _evidence(Visibility.TERMINAL).model_copy(
+        update={"kind": EvidenceKind.AGENT_SELF_REPORT, "strength": "strong"}
+    )
+    others = [
+        _evidence(Visibility.TERMINAL).model_copy(update={"kind": kind, "strength": "weak"})
+        for kind in EvidenceKind
+        if kind is not EvidenceKind.AGENT_SELF_REPORT
+    ]
+
+    assert all(other.trust_rank > self_report.trust_rank for other in others)

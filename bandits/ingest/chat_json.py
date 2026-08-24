@@ -11,29 +11,66 @@ downstream mistakes assigned order for real timing.
 
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_source
 from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
-def _conversations(payload: object) -> list[list[dict]]:
-    """A file is either one conversation (a bare message array) or a list of them."""
+_LINEAGE_KEYS = ("session_id", "conversation_id", "thread_id", "lineage_id")
+
+
+def _lineage_of(container: dict) -> str | None:
+    return next(
+        (
+            container[key]
+            for key in _LINEAGE_KEYS
+            if isinstance(container.get(key), str) and container[key]
+        ),
+        None,
+    )
+
+
+def _conversations(payload: object) -> list[tuple[list[dict], str | None]]:
+    """A file is either one conversation (a bare message array) or a list of them.
+
+    Each is paired with its declared session id, when the wrapper carries one; a
+    bare message array has nowhere to declare one and yields None.
+    """
     if (
         isinstance(payload, list)
         and payload
         and all(isinstance(item, dict) and "role" in item for item in payload)
     ):
-        return [payload]
+        return [(payload, None)]
     if isinstance(payload, list):
-        return [c.get("messages", []) for c in payload if isinstance(c, dict)]
+        return [(c.get("messages", []), _lineage_of(c)) for c in payload if isinstance(c, dict)]
     if isinstance(payload, dict):
-        return [payload.get("messages", [])]
+        return [(payload.get("messages", []), _lineage_of(payload))]
     return []
+
+
+def _tool_result(content: object) -> object:
+    """Parse a tool result that arrived as JSON text, keeping the text otherwise.
+
+    Chat exports serialize tool returns into the ``content`` string. Leaving them
+    as text would hide every structured field from outcome extraction, so a JSON
+    object or array is parsed back; anything else is genuinely prose and is kept
+    exactly as it came.
+    """
+    if not isinstance(content, str):
+        return content
+    stripped = content.strip()
+    if not stripped or stripped[0] not in "{[":
+        return content
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return content
 
 
 def _tool_calls(message: dict) -> list[dict]:
@@ -46,6 +83,7 @@ def _convert_conversation(
     *,
     trace_id: str,
     source_digest: str,
+    lineage_id: str | None,
     location: str,
     issues: list[TraceIssue],
 ) -> Trace | None:
@@ -145,7 +183,7 @@ def _convert_conversation(
                     name=name,
                     started_at=timestamp,
                     ended_at=timestamp,
-                    output=message.get("content"),
+                    output=_tool_result(message.get("content")),
                     status=SpanStatus.OK,
                     attributes={"synthetic_time": True},
                 )
@@ -175,35 +213,48 @@ def _convert_conversation(
         source="chat-json",
         source_digest=source_digest,
         task=task,
+        lineage_id=lineage_id,
         spans=tuple(spans),
     )
 
 
-def load_chat_json(path: Path) -> TraceCorpus:
+def load_chat_json(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> TraceCorpus:
     """Read one chat-JSON export (one conversation or an array of them) into a
     :class:`~bandits.traces.TraceCorpus`."""
-    raw = path.read_bytes()
-    source_digest = hashlib.sha256(raw).hexdigest()
+    source = redact_source(path, ruleset)
+    raw = source.data
+    source_digest = source.source_digest
 
-    issues: list[TraceIssue] = []
+    issues: list[TraceIssue] = list(source.issues)
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         issues.append(TraceIssue(kind="malformed_json", detail=str(exc), location=str(path)))
-        return TraceCorpus(source="chat-json", traces=(), issues=tuple(issues))
+        return TraceCorpus(
+            source="chat-json",
+            traces=(),
+            issues=tuple(issues),
+            redaction_ruleset=source.ruleset,
+        )
 
     conversations = _conversations(payload)
     traces: list[Trace] = []
-    for index, messages in enumerate(conversations):
+    for index, (messages, lineage_id) in enumerate(conversations):
         location = f"{path}[{index}]"
         trace = _convert_conversation(
             messages,
             trace_id=f"{path.stem}-{index}",
             source_digest=source_digest,
+            lineage_id=lineage_id,
             location=location,
             issues=issues,
         )
         if trace is not None:
             traces.append(trace)
 
-    return TraceCorpus(source="chat-json", traces=tuple(traces), issues=tuple(issues))
+    return TraceCorpus(
+        source="chat-json",
+        traces=tuple(traces),
+        issues=tuple(issues),
+        redaction_ruleset=source.ruleset,
+    )

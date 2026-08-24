@@ -41,3 +41,6 @@ ignore = [
 [tool.pytest.ini_options]
 testpaths = ["tests", "bandits"]
 addopts = "-q"
+
+[tool.coverage.run]
+omit = ["*/*_test.py"]

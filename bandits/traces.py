@@ -78,6 +78,15 @@ class Trace(Contract):
     task: str | None = None
     """The user-facing instruction, when the source declares one."""
 
+    lineage_id: str | None = None
+    """Session, ticket, or retry chain this episode belongs to.
+
+    Traces sharing one must never straddle a fit/held-out split: a retry of the
+    same request on both sides of the boundary leaks the answer across it. None
+    means the source declared no grouping, which is recorded rather than assumed
+    to mean independence.
+    """
+
     spans: tuple[Span, ...]
 
 
@@ -87,3 +96,11 @@ class TraceCorpus(Contract):
     source: str
     traces: tuple[Trace, ...]
     issues: tuple[TraceIssue, ...] = ()
+
+    redaction_ruleset: str | None = None
+    """Which redaction ruleset produced these bytes.
+
+    Recorded because the same source file under a changed ruleset yields a
+    different corpus, and without this there would be nothing to explain why two
+    corpora sharing a ``source_digest`` do not match.
+    """

@@ -26,12 +26,23 @@ MODEL span, ``"execute_tool"`` is a TOOL span. Anything else is a
 
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
 
+from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_source
 from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue
+
+_LINEAGE_KEYS = (
+    "gen_ai.conversation.id",
+    "session.id",
+    "session_id",
+    "conversation.id",
+    "conversation_id",
+    "thread.id",
+    "thread_id",
+)
+"""Attribute names carrying a session grouping, in decreasing order of standardness."""
 
 _OPERATION_TO_KIND = {
     "chat": SpanKind.MODEL,
@@ -52,9 +63,11 @@ def _parse_timestamp(value: object) -> datetime | None:
         return None
 
 
-def _parse_record(record: dict, *, location: str) -> tuple[Span | None, str | None, str | None]:
-    """Returns ``(span, trace_id, task)`` for a valid record, or ``(None, None, None)``
-    plus an appended issue when the record can't become a span."""
+def _parse_record(record: dict, *, location: str) -> tuple[Span, str, str | None, str | None]:
+    """Returns ``(span, trace_id, task, lineage_id)`` for a valid record.
+
+    Raises :class:`_RecordError` rather than returning a partial span when the
+    record cannot be normalized."""
     trace_id = record.get("trace_id")
     span_id = record.get("span_id")
     name = record.get("name")
@@ -93,6 +106,14 @@ def _parse_record(record: dict, *, location: str) -> tuple[Span | None, str | No
     status = SpanStatus.ERROR if attributes.get("status") == "error" else SpanStatus.OK
     parent_span_id = record.get("parent_span_id") or None
     task = attributes.get("task") if parent_span_id is None else None
+    lineage_id = next(
+        (
+            attributes[key]
+            for key in _LINEAGE_KEYS
+            if isinstance(attributes.get(key), str) and attributes[key]
+        ),
+        None,
+    )
 
     span = Span(
         span_id=span_id,
@@ -106,7 +127,7 @@ def _parse_record(record: dict, *, location: str) -> tuple[Span | None, str | No
         output=output,
         attributes=attributes,
     )
-    return span, trace_id, task
+    return span, trace_id, task, lineage_id
 
 
 class _RecordError(Exception):
@@ -116,14 +137,16 @@ class _RecordError(Exception):
         self.location = location
 
 
-def load_otlp(path: Path) -> TraceCorpus:
+def load_otlp(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> TraceCorpus:
     """Read one OTLP JSONL export into a :class:`TraceCorpus`."""
-    raw = path.read_bytes()
-    source_digest = hashlib.sha256(raw).hexdigest()
+    source = redact_source(path, ruleset)
+    raw = source.data
+    source_digest = source.source_digest
 
     spans_by_trace: dict[str, list[Span]] = {}
     task_by_trace: dict[str, str] = {}
-    issues: list[TraceIssue] = []
+    lineage_by_trace: dict[str, str] = {}
+    issues: list[TraceIssue] = list(source.issues)
 
     for index, line in enumerate(raw.split(b"\n")):
         if not line.strip():
@@ -144,7 +167,7 @@ def load_otlp(path: Path) -> TraceCorpus:
             )
             continue
         try:
-            span, trace_id, task = _parse_record(record, location=location)
+            span, trace_id, task, lineage_id = _parse_record(record, location=location)
         except _RecordError as exc:
             issues.append(
                 TraceIssue(kind="malformed_span", detail=exc.detail, location=exc.location)
@@ -153,6 +176,8 @@ def load_otlp(path: Path) -> TraceCorpus:
         spans_by_trace.setdefault(trace_id, []).append(span)
         if task is not None:
             task_by_trace[trace_id] = task
+        if lineage_id is not None:
+            lineage_by_trace.setdefault(trace_id, lineage_id)
 
     traces = tuple(
         Trace(
@@ -160,8 +185,14 @@ def load_otlp(path: Path) -> TraceCorpus:
             source="otlp",
             source_digest=source_digest,
             task=task_by_trace.get(trace_id),
+            lineage_id=lineage_by_trace.get(trace_id),
             spans=tuple(sorted(spans, key=lambda s: (s.started_at, s.span_id))),
         )
         for trace_id, spans in sorted(spans_by_trace.items())
     )
-    return TraceCorpus(source="otlp", traces=traces, issues=tuple(issues))
+    return TraceCorpus(
+        source="otlp",
+        traces=traces,
+        issues=tuple(issues),
+        redaction_ruleset=source.ruleset,
+    )
