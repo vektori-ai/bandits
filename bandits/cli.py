@@ -332,6 +332,9 @@ def draft_verifier_command(
     task_set_id: str,
     family_id: str = typer.Option(..., "--family", help="Family to draft checks for."),
     limit: int = typer.Option(3, "--limit", help="Maximum independent verifier drafts."),
+    interview: bool = typer.Option(
+        False, "--interview", help="Immediately run the bounded owner-review interview."
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Propose deterministic replay verifiers from recorded terminal evidence."""
@@ -362,6 +365,25 @@ def draft_verifier_command(
     console.print(table)
     for unresolved in draft.unresolved:
         console.print(f"[yellow]unresolved:[/yellow] {unresolved}")
+    if interview:
+        _run_verifier_interview(draft, envelope.artifact_id, store)
+
+
+def _run_verifier_interview(draft, verifier_draft_id: str, store: DerivedStore) -> None:
+    interview = start_interview(draft, verifier_draft_id)
+    while (question := next_question(interview)) is not None:
+        console.print(f"\n[bold]{question.prompt}[/bold]")
+        answer = typer.prompt("Answer", default="", show_default=False)
+        interview = answer_question(interview, answer)
+
+    envelope = save_interview(interview, store)
+    console.print(f"interview_id: {envelope.artifact_id}")
+    console.print(f"questions:    {len(interview.questions)}")
+    console.print("status:       complete")
+    console.print(
+        "[yellow]note:[/yellow] review refined the hypothesis; validation is still required "
+        "before calibrated or reviewed status"
+    )
 
 
 @app.command(name="interview-verifier")
@@ -377,20 +399,7 @@ def interview_verifier_command(
         console.print(f"[red]error:[/red] no verifier draft {verifier_draft_id!r}")
         raise typer.Exit(code=1) from exc
 
-    interview = start_interview(draft, verifier_draft_id)
-    while (question := next_question(interview)) is not None:
-        console.print(f"\n[bold]{question.prompt}[/bold]")
-        answer = typer.prompt("Answer", default="", show_default=False)
-        interview = answer_question(interview, answer)
-
-    envelope = save_interview(interview, store)
-    console.print(f"interview_id: {envelope.artifact_id}")
-    console.print(f"questions:    {len(interview.questions)}")
-    console.print("status:       complete")
-    console.print(
-        "[yellow]note:[/yellow] review refined the hypothesis; validation is still required "
-        "before calibrated or reviewed status"
-    )
+    _run_verifier_interview(draft, verifier_draft_id, store)
 
 
 if __name__ == "__main__":

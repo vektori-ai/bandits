@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 
 from bandits.traces import Contract
 
@@ -37,7 +37,7 @@ class CheckSpec(Contract):
     claim: str
     operator: CheckOperator
     expected: Any = None
-    weight: float = 1.0
+    weight: float = Field(default=1.0, gt=0)
     supporting_evidence_ids: tuple[str, ...]
     description: str
 

@@ -14,6 +14,7 @@ from bandits.verify.models import (
     VerifierDraft,
     VerifierMode,
     VerifierSpec,
+    VerifierStatus,
 )
 
 
@@ -59,6 +60,7 @@ def _proposal(
         family_id=family.family_id,
         task_set_id=task_set_id,
         mode=VerifierMode.REPLAY,
+        status=VerifierStatus.EXECUTABLE,
         inputs=(f"terminal_evidence:{claim}",),
         checks=(
             CheckSpec(
@@ -133,6 +135,32 @@ def draft_verifiers(
                 description=f"Require terminal field {key!r} to equal the observed value {expected!r}.",
                 blind_spots=("The field may be necessary but not sufficient for task success.",),
                 gaming=(f"Set {key!r} without completing the other intended state changes.",),
+            )
+        )
+
+    exact_output_task = any(
+        marker in family.descriptor
+        for marker in ("return exactly", "respond exactly", "output exactly", "print exactly")
+    )
+    outputs = [item for item in evidence if item.claim == "final_output"] if exact_output_task else []
+    output_groups: dict[str, list[Evidence]] = {}
+    for item in outputs:
+        output_groups.setdefault(_stable_value(item.value.get("output")), []).append(item)
+    for _, support in sorted(output_groups.items(), key=lambda pair: (-len(pair[1]), pair[0])):
+        expected = support[0].value.get("output")
+        proposals.append(
+            _proposal(
+                family=family,
+                task_set_id=task_set_id,
+                claim="final_output",
+                operator=CheckOperator.EXACT_OUTPUT,
+                expected=expected,
+                evidence=support,
+                description="Require the terminal output to exactly match the recorded value.",
+                blind_spots=(
+                    "Exact text can reject semantically correct answers and is based on agent output, not external state.",
+                ),
+                gaming=("Emit the expected text without completing the underlying task.",),
             )
         )
 

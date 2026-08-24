@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 from bandits.analyze import analyze_corpus, compute_analysis_id, mine_task_set
 from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
+from bandits.traces import Span, SpanKind, Trace, TraceCorpus
 from bandits.verify import (
     VerifierMode,
     VerifierStatus,
@@ -30,7 +32,7 @@ def test_coding_family_proposes_exit_code_check() -> None:
 
     spec = next(v for v in draft.verifiers if v.checks[0].claim == "command_exit_code")
     assert spec.mode is VerifierMode.REPLAY
-    assert spec.status is VerifierStatus.SUGGESTED
+    assert spec.status is VerifierStatus.EXECUTABLE
     assert spec.checks[0].expected == 0
     assert spec.blind_spots
     assert spec.gaming_hypotheses
@@ -68,3 +70,37 @@ def test_draft_round_trips_with_task_set_as_parent(tmp_path) -> None:
     assert envelope.parent_artifact_id == "taskset-test"
     assert envelope.kind == "verifier_draft"
     assert load_verifier_draft(envelope.artifact_id, store) == draft
+
+
+def test_exact_output_is_proposed_only_when_the_instruction_requires_exact_text() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    corpus = TraceCorpus(
+        source="test",
+        traces=(
+            Trace(
+                trace_id="exact-one",
+                source="test",
+                source_digest="a" * 64,
+                task="Return exactly OK",
+                spans=(
+                    Span(
+                        span_id="reply",
+                        kind=SpanKind.MODEL,
+                        name="assistant",
+                        started_at=now,
+                        ended_at=now,
+                        output="OK",
+                    ),
+                ),
+            ),
+        ),
+    )
+    analysis = analyze_corpus(corpus)
+    task_set = mine_task_set(analysis, compute_analysis_id(analysis), budget=1)
+
+    draft = draft_verifiers(
+        task_set, "taskset-test", analysis, task_set.families[0].family_id
+    )
+
+    assert draft.verifiers[0].checks[0].operator.value == "exact_output"
+    assert "agent output" in draft.verifiers[0].blind_spots[0]
