@@ -112,3 +112,39 @@ class VerifierDraft(Contract):
             if spec.family_id != self.family_id or spec.task_set_id != self.task_set_id:
                 raise ValueError("verifier draft contains a spec for another family or task set")
         return self
+
+
+class InterviewQuestion(Contract):
+    question_id: str
+    verifier_id: str
+    field: Literal["expected", "blind_spots", "gaming_hypotheses"]
+    prompt: str
+    current_value: Any = None
+
+
+class InterviewAnswer(Contract):
+    question_id: str
+    value: str
+
+
+class VerifierInterview(Contract):
+    schema_version: int = 1
+    source_draft_id: str
+    draft: VerifierDraft
+    questions: tuple[InterviewQuestion, ...]
+    answers: tuple[InterviewAnswer, ...] = ()
+    next_question_index: int = 0
+    complete: bool = False
+
+    @model_validator(mode="after")
+    def validate_progress(self) -> VerifierInterview:
+        if self.next_question_index != len(self.answers):
+            raise ValueError("interview progress must match its recorded answers")
+        if self.next_question_index > len(self.questions):
+            raise ValueError("interview progressed past its final question")
+        if self.complete != (self.next_question_index == len(self.questions)):
+            raise ValueError("interview completion flag disagrees with its progress")
+        expected_ids = [q.question_id for q in self.questions[: self.next_question_index]]
+        if [a.question_id for a in self.answers] != expected_ids:
+            raise ValueError("answers must correspond to questions in order")
+        return self

@@ -8,7 +8,7 @@ from bandits.analyze import load_task_set
 from bandits.cli import app
 from bandits.ingest.otlp import load_otlp
 from bandits.store import DerivedStore, compute_artifact_id
-from bandits.verify import load_verifier_draft
+from bandits.verify import load_interview, load_verifier_draft
 
 runner = CliRunner()
 FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "traces.otlp.jsonl"
@@ -226,3 +226,41 @@ def test_draft_verifier_rejects_unknown_family(tmp_path) -> None:
     )
 
     assert result.exit_code == 1
+
+
+def test_interview_verifier_completes_a_bounded_review(tmp_path) -> None:
+    task_set_id = _mined(tmp_path)
+    store = DerivedStore(tmp_path / ".bandits")
+    family = next(
+        item for item in load_task_set(task_set_id, store).families if "refund" in item.descriptor
+    )
+    drafted = runner.invoke(
+        app,
+        [
+            "draft-verifier",
+            task_set_id,
+            "--family",
+            family.family_id,
+            "--project",
+            str(tmp_path),
+        ],
+    )
+    draft_id = drafted.stdout.split()[1]
+
+    result = runner.invoke(
+        app,
+        ["interview-verifier", draft_id, "--project", str(tmp_path)],
+        input="\namount may differ\nstatus can be written directly\n",
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "status:       complete" in result.stdout
+    interview_id = next(
+        line.split(maxsplit=1)[1]
+        for line in result.stdout.splitlines()
+        if line.startswith("interview_id:")
+    )
+    interview = load_interview(interview_id, store)
+    assert interview.complete
+    assert len(interview.answers) == 3
+    assert interview.draft.verifiers[0].status.value == "suggested"
