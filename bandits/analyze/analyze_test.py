@@ -6,16 +6,17 @@ layer cannot quietly grow assumptions that only hold for one of them.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from bandits.analyze import analyze_corpus, extract_task, load_analysis, save_analysis
-from bandits.analyze.models import Visibility
+from bandits.analyze.models import EvidenceKind, Visibility
 from bandits.analyze.outcomes import extract_outcome_evidence
 from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
-from bandits.traces import Trace, TraceCorpus
+from bandits.traces import Span, SpanKind, Trace, TraceCorpus
 
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 
@@ -127,3 +128,75 @@ def test_analyzing_the_same_corpus_twice_is_stable(tmp_path, coding: TraceCorpus
     second = save_analysis(analyze_corpus(coding), store)
 
     assert first.artifact_id == second.artifact_id
+
+
+def test_tool_result_before_final_model_is_terminal_state_evidence() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    spans = (
+        Span(
+            span_id="tool",
+            kind=SpanKind.TOOL,
+            name="refund_order",
+            started_at=start,
+            ended_at=start,
+            output={"status": "refunded"},
+        ),
+        Span(
+            span_id="reply",
+            kind=SpanKind.MODEL,
+            name="assistant",
+            started_at=start + timedelta(seconds=1),
+            ended_at=start + timedelta(seconds=1),
+            output="Refund completed",
+        ),
+    )
+    trace = Trace(
+        trace_id="refund", source="otlp", source_digest="a" * 64, task="Refund it", spans=spans
+    )
+
+    task, _ = extract_task(trace)
+    evidence = extract_outcome_evidence(trace)
+    final_state = next(e for e in evidence if e.claim == "final_state_field")
+
+    assert task.terminal_span_ids == ("tool", "reply")
+    assert final_state.span_id == "tool"
+    assert final_state.visibility is Visibility.TERMINAL
+
+
+def test_a_closing_claim_is_recorded_as_self_report_and_ranked_last() -> None:
+    """The chat fixture ends with the agent asserting it finished."""
+    corpus = load_corpus(FIXTURES / "traces.chat.jsonl", "chat-json")
+    analysis = analyze_corpus(corpus)
+
+    final_output = next(e for e in analysis.evidence if e.claim == "final_output")
+    others = [e for e in analysis.evidence if e.claim != "final_output"]
+
+    assert final_output.kind is EvidenceKind.AGENT_SELF_REPORT
+    assert final_output.visibility is Visibility.TERMINAL
+    assert all(e.trust_rank > final_output.trust_rank for e in others)
+
+
+def test_recorded_score_outranks_the_agents_own_claim() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    trace = Trace(
+        trace_id="scored",
+        source="otlp",
+        source_digest="a" * 64,
+        task="Do the thing",
+        spans=(
+            Span(
+                span_id="reply",
+                kind=SpanKind.MODEL,
+                name="assistant",
+                started_at=start,
+                ended_at=start,
+                output="All done!",
+                attributes={"score": 0.0},
+            ),
+        ),
+    )
+
+    evidence = {e.claim: e for e in extract_outcome_evidence(trace)}
+
+    assert evidence["recorded_score"].kind is EvidenceKind.TRUSTED_EVALUATOR
+    assert evidence["recorded_score"].trust_rank > evidence["final_output"].trust_rank

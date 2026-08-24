@@ -4,9 +4,11 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+from bandits.analyze import load_task_set
 from bandits.cli import app
 from bandits.ingest.otlp import load_otlp
-from bandits.store import compute_artifact_id
+from bandits.store import DerivedStore, compute_artifact_id
+from bandits.verify import load_verifier_draft
 
 runner = CliRunner()
 FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "traces.otlp.jsonl"
@@ -85,4 +87,142 @@ def test_analyze_reads_a_coding_corpus_too(tmp_path) -> None:
 
 def test_analyze_unknown_artifact_exits_nonzero(tmp_path) -> None:
     result = runner.invoke(app, ["analyze", "corpus-nope", "--project", str(tmp_path)])
+    assert result.exit_code == 1
+
+
+SUPPORT_FIXTURE = (
+    Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "traces.support.otlp.jsonl"
+)
+
+
+def _mined(tmp_path: Path) -> str:
+    """Ingest, analyze and mine the support fixture; return the task set id."""
+    runner.invoke(
+        app, ["ingest", str(SUPPORT_FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
+    )
+    corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
+    analyzed = runner.invoke(app, ["analyze", corpus_id, "--project", str(tmp_path)])
+    analysis_id = analyzed.stdout.split()[1]
+    mined = runner.invoke(app, ["mine", analysis_id, "--budget", "10", "--project", str(tmp_path)])
+    assert mined.exit_code == 0, mined.stdout
+    return mined.stdout.split()[1]
+
+
+def test_mine_reports_coverage_and_unfilled_slots(tmp_path) -> None:
+    runner.invoke(
+        app, ["ingest", str(SUPPORT_FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
+    )
+    corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
+    analysis_id = runner.invoke(
+        app, ["analyze", corpus_id, "--project", str(tmp_path)]
+    ).stdout.split()[1]
+
+    result = runner.invoke(app, ["mine", analysis_id, "--budget", "10", "--project", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "taskset_id:  taskset-" in result.stdout
+    assert "coverage:" in result.stdout
+    assert "missing slot" in result.stdout
+
+
+def test_families_shows_one_family_in_full(tmp_path) -> None:
+    task_set_id = _mined(tmp_path)
+    store = DerivedStore(tmp_path / ".bandits")
+    family = load_task_set(task_set_id, store).families[0]
+
+    result = runner.invoke(
+        # The table truncates ids for width, so the id comes from the artifact.
+        app,
+        ["families", task_set_id, "--family", family.family_id, "--project", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0
+    assert family.descriptor in result.stdout
+    assert family.medoid_trace_id in result.stdout
+    assert "held_out" in result.stdout
+
+
+def test_families_rejects_an_unknown_family(tmp_path) -> None:
+    task_set_id = _mined(tmp_path)
+
+    result = runner.invoke(
+        app, ["families", task_set_id, "--family", "family-nope", "--project", str(tmp_path)]
+    )
+
+    assert result.exit_code == 1
+
+
+def test_merge_families_writes_a_new_task_set(tmp_path) -> None:
+    task_set_id = _mined(tmp_path)
+    store = DerivedStore(tmp_path / ".bandits")
+    families = load_task_set(task_set_id, store).families
+
+    result = runner.invoke(
+        app,
+        # fmt: off
+        [
+            "merge-families",
+            task_set_id,
+            families[0].family_id,
+            families[1].family_id,
+            "--project",
+            str(tmp_path),
+        ],
+        # fmt: on
+    )
+
+    assert result.exit_code == 0
+    merged_id = result.stdout.split()[1]
+    assert merged_id != task_set_id
+    assert load_task_set(task_set_id, store).families == families, "the original is untouched"
+    assert len(load_task_set(merged_id, store).families) == len(families) - 1
+
+
+def test_mine_unknown_analysis_exits_nonzero(tmp_path) -> None:
+    result = runner.invoke(app, ["mine", "analysis-nope", "--project", str(tmp_path)])
+    assert result.exit_code == 1
+
+
+def test_draft_verifier_writes_suggested_replay_specs(tmp_path) -> None:
+    task_set_id = _mined(tmp_path)
+    store = DerivedStore(tmp_path / ".bandits")
+    family = next(
+        item for item in load_task_set(task_set_id, store).families if "refund" in item.descriptor
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "draft-verifier",
+            task_set_id,
+            "--family",
+            family.family_id,
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    draft_id = result.stdout.split()[1]
+    draft = load_verifier_draft(draft_id, store)
+    assert draft.verifiers
+    assert all(spec.status.value == "suggested" for spec in draft.verifiers)
+    assert all(spec.mode.value == "replay" for spec in draft.verifiers)
+
+
+def test_draft_verifier_rejects_unknown_family(tmp_path) -> None:
+    task_set_id = _mined(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "draft-verifier",
+            task_set_id,
+            "--family",
+            "family-nope",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
     assert result.exit_code == 1

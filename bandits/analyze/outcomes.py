@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from bandits.analyze.models import Evidence, Visibility, evidence_id
+from bandits.analyze.models import Evidence, EvidenceKind, Visibility, evidence_id
+from bandits.analyze.terminal import terminal_spans
 from bandits.traces import Span, SpanKind, SpanStatus, Trace
 
 _EXIT_CODE_KEYS = ("exit_code", "exitcode", "returncode", "return_code")
@@ -30,6 +31,7 @@ def _evidence(
     value: Any,
     visibility: Visibility,
     strength: str,
+    kind: EvidenceKind = EvidenceKind.OBSERVED_TRACE,
 ) -> Evidence:
     span_id = span.span_id if span is not None else None
     return Evidence(
@@ -39,6 +41,7 @@ def _evidence(
         visibility=visibility,
         provenance="observed",
         strength=strength,  # type: ignore[arg-type]
+        kind=kind,
         trace_id=trace_id,
         span_id=span_id,
     )
@@ -56,14 +59,14 @@ def _first_key(payload: Any, keys: tuple[str, ...]) -> tuple[str, Any] | None:
 def extract_outcome_evidence(trace: Trace) -> tuple[Evidence, ...]:
     """Collect every recorded signal about how this episode went."""
     found: dict[str, Evidence] = {}
-    last_span_id = trace.spans[-1].span_id if trace.spans else None
+    terminal_ids = {span.span_id for span in terminal_spans(trace.spans)}
 
     def record(evidence: Evidence) -> None:
         found.setdefault(evidence.evidence_id, evidence)
 
     for span in trace.spans:
-        is_last = span.span_id == last_span_id
-        visibility = Visibility.TERMINAL if is_last else Visibility.DURING
+        is_terminal = span.span_id in terminal_ids
+        visibility = Visibility.TERMINAL if is_terminal else Visibility.DURING
 
         if span.status is SpanStatus.ERROR:
             record(
@@ -74,6 +77,7 @@ def extract_outcome_evidence(trace: Trace) -> tuple[Evidence, ...]:
                     value={"name": span.name, "kind": span.kind.value},
                     visibility=visibility,
                     strength="strong",
+                    kind=EvidenceKind.STRUCTURED_EXTERNAL_RESULT,
                 )
             )
 
@@ -89,6 +93,7 @@ def extract_outcome_evidence(trace: Trace) -> tuple[Evidence, ...]:
                     value={"key": exit_code[0], "value": exit_code[1], "tool": span.name},
                     visibility=visibility,
                     strength="strong",
+                    kind=EvidenceKind.STRUCTURED_EXTERNAL_RESULT,
                 )
             )
 
@@ -104,10 +109,11 @@ def extract_outcome_evidence(trace: Trace) -> tuple[Evidence, ...]:
                     value={"key": recorded_score[0], "value": recorded_score[1]},
                     visibility=Visibility.POST_HOC,
                     strength="moderate",
+                    kind=EvidenceKind.TRUSTED_EVALUATOR,
                 )
             )
 
-        if span.kind is SpanKind.TOOL and is_last:
+        if span.kind is SpanKind.TOOL and is_terminal:
             state = _first_key(span.output, _STATE_KEYS)
             if state is not None:
                 record(
@@ -118,8 +124,24 @@ def extract_outcome_evidence(trace: Trace) -> tuple[Evidence, ...]:
                         value={"key": state[0], "value": state[1], "tool": span.name},
                         visibility=Visibility.TERMINAL,
                         strength="moderate",
+                        kind=EvidenceKind.STRUCTURED_EXTERNAL_RESULT,
                     )
                 )
+
+        if span.kind is SpanKind.MODEL and is_terminal and span.output:
+            # An agent saying it finished is a claim about the episode, recorded
+            # so a verifier can see it and rank it last — never so it can count.
+            record(
+                _evidence(
+                    span,
+                    trace_id=trace.trace_id,
+                    claim="final_output",
+                    value={"output": span.output},
+                    visibility=Visibility.TERMINAL,
+                    strength="weak",
+                    kind=EvidenceKind.AGENT_SELF_REPORT,
+                )
+            )
 
         if span.kind is SpanKind.TOOL and span.output is None and span.status is SpanStatus.OK:
             # An absent result is absent. It is never an empty successful result.

@@ -14,7 +14,8 @@ from bandits.analyze.models import (
     build_task_candidate,
     evidence_id,
 )
-from bandits.traces import Span, SpanKind, Trace
+from bandits.analyze.terminal import terminal_spans
+from bandits.traces import SpanKind, Trace
 
 
 def _observed(
@@ -36,20 +37,6 @@ def _observed(
         trace_id=trace_id,
         span_id=span_id,
     )
-
-
-def _terminal_spans(spans: tuple[Span, ...]) -> tuple[Span, ...]:
-    """The trailing spans that describe how the episode ended.
-
-    Takes the final span plus any final tool call it depends on, because a model
-    span saying "done" is weaker terminal evidence than the tool result before it.
-    """
-    if not spans:
-        return ()
-    last = spans[-1]
-    if last.kind is SpanKind.MODEL and len(spans) >= 2 and spans[-2].kind is SpanKind.TOOL:
-        return (spans[-2], last)
-    return (last,)
 
 
 def extract_task(trace: Trace) -> tuple[TaskCandidate, tuple[Evidence, ...]]:
@@ -92,7 +79,7 @@ def extract_task(trace: Trace) -> tuple[TaskCandidate, tuple[Evidence, ...]]:
             "available toolset is not recorded; only the tools this episode called are known"
         )
 
-    terminal = _terminal_spans(trace.spans)
+    terminal = terminal_spans(trace.spans)
     terminal_ids = tuple(s.span_id for s in terminal)
     trajectory_ids = tuple(s.span_id for s in trace.spans if s.span_id not in set(terminal_ids))
 
@@ -109,6 +96,7 @@ def extract_task(trace: Trace) -> tuple[TaskCandidate, tuple[Evidence, ...]]:
     task = build_task_candidate(
         task_id=f"task-{trace.trace_id}",
         trace_id=trace.trace_id,
+        lineage_id=trace.lineage_id,
         instruction=trace.task,
         prompt_evidence=tuple(prompt_evidence),
         trajectory_span_ids=trajectory_ids,
