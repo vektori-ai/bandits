@@ -3,9 +3,11 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from bandits.analyze.models import EvidenceKind
 from bandits.verify.models import (
     CheckOperator,
     CheckSpec,
+    InterviewQuestion,
     Result,
     SubScore,
     VerifierMode,
@@ -62,15 +64,91 @@ def test_unknown_result_is_none_not_zero() -> None:
     assert result.score is None
 
 
-def test_unknown_aggregate_cannot_hide_a_known_subscore() -> None:
-    with pytest.raises(ValidationError, match="unknown aggregate"):
+def test_unknown_aggregate_keeps_the_subscores_that_were_known() -> None:
+    """Which checks passed while another was unscorable is the record worth having."""
+    result = Result(
+        verifier_id="verifier-one",
+        score=None,
+        subscores=(
+            SubScore(check_id="check-one", score=1.0),
+            SubScore(check_id="check-two", score=None),
+        ),
+    )
+
+    assert result.score is None
+    assert [part.score for part in result.subscores] == [1.0, None]
+
+
+def test_a_known_aggregate_cannot_sit_on_an_unknown_subscore() -> None:
+    """Fail closed: one unscorable check makes the whole verifier unknown."""
+    with pytest.raises(ValidationError, match="cannot contain an unknown subscore"):
         Result(
             verifier_id="verifier-one",
-            score=None,
-            subscores=(SubScore(check_id="check-one", score=0.0),),
+            score=1.0,
+            subscores=(
+                SubScore(check_id="check-one", score=1.0),
+                SubScore(check_id="check-two", score=None),
+            ),
         )
+
+
+def test_a_result_without_any_subscore_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="at least one subscore"):
+        Result(verifier_id="verifier-one", score=None, subscores=())
 
 
 def test_replay_verifier_cannot_claim_a_live_input() -> None:
     with pytest.raises(ValidationError, match="replay verifier"):
         _spec(inputs=("live:orders_database",))
+
+
+def test_a_self_report_only_verifier_cannot_be_promoted() -> None:
+    """The agent asserting it finished is never sufficient on its own."""
+    self_report = CheckSpec(
+        check_id="check-one",
+        claim="final_output",
+        operator=CheckOperator.EXACT_OUTPUT,
+        expected="done",
+        supporting_evidence_ids=(),
+        description="d",
+        evidence_kind=EvidenceKind.AGENT_SELF_REPORT,
+    )
+
+    drafted = _spec(checks=(self_report,))
+    assert drafted.rests_only_on_self_report
+
+    with pytest.raises(ValidationError, match="stronger than agent self-report"):
+        _spec(
+            checks=(self_report,),
+            status=VerifierStatus.CALIBRATED,
+            validation_artifact_id="validation-1",
+        )
+
+
+def test_one_stronger_check_lifts_the_verifier_off_self_report() -> None:
+    external = CheckSpec(
+        check_id="check-two",
+        claim="final_state_field:status",
+        operator=CheckOperator.EQUALS,
+        expected="refunded",
+        supporting_evidence_ids=(),
+        description="d",
+        evidence_kind=EvidenceKind.STRUCTURED_EXTERNAL_RESULT,
+    )
+    self_report = external.replace(
+        check_id="check-one", evidence_kind=EvidenceKind.AGENT_SELF_REPORT
+    )
+
+    spec = _spec(
+        checks=(self_report, external),
+        status=VerifierStatus.CALIBRATED,
+        validation_artifact_id="validation-1",
+    )
+
+    assert not spec.rests_only_on_self_report
+    assert spec.weakest_evidence_kind is EvidenceKind.AGENT_SELF_REPORT
+
+
+def test_an_expected_question_must_name_its_check() -> None:
+    with pytest.raises(ValidationError, match="must name the check"):
+        InterviewQuestion(question_id="q1", verifier_id="v1", field="expected", prompt="?")

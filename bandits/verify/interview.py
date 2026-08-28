@@ -7,29 +7,40 @@ import json
 
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.verify.models import (
+    CheckOperator,
     InterviewAnswer,
     InterviewQuestion,
     VerifierDraft,
     VerifierInterview,
 )
 
+_HAS_EXPECTED_VALUE = frozenset({CheckOperator.EQUALS, CheckOperator.EXACT_OUTPUT})
+
 
 def _questions(draft: VerifierDraft) -> tuple[InterviewQuestion, ...]:
     questions: list[InterviewQuestion] = []
     for spec in draft.verifiers:
-        check = spec.checks[0]
+        questions.extend(
+            InterviewQuestion(
+                question_id=f"q-{spec.verifier_id}-{check.check_id}-expected",
+                verifier_id=spec.verifier_id,
+                check_id=check.check_id,
+                field="expected",
+                current_value=check.expected,
+                prompt=(
+                    f"For {check.claim}, what exact value represents success? "
+                    f"Press Enter to keep {check.expected!r}."
+                ),
+            )
+            # Only checks that compare against a value have one to confirm. An
+            # invariant compares two observed fields and a no-error check
+            # compares nothing; asking their expected value is a question with
+            # no answer, and it teaches the owner the interview is boilerplate.
+            for check in spec.checks
+            if check.operator in _HAS_EXPECTED_VALUE
+        )
         questions.extend(
             (
-                InterviewQuestion(
-                    question_id=f"q-{spec.verifier_id}-expected",
-                    verifier_id=spec.verifier_id,
-                    field="expected",
-                    current_value=check.expected,
-                    prompt=(
-                        f"For {check.claim}, what exact value represents success? "
-                        f"Press Enter to keep {check.expected!r}."
-                    ),
-                ),
                 InterviewQuestion(
                     question_id=f"q-{spec.verifier_id}-blind-spot",
                     verifier_id=spec.verifier_id,
@@ -83,27 +94,31 @@ def answer_question(interview: VerifierInterview, value: str) -> VerifierIntervi
             revised.append(spec)
             continue
         if question.field == "expected":
-            check = spec.checks[0]
-            replacement = _parse_expected(value, check.expected)
-            revised.append(spec.model_copy(update={"checks": (check.model_copy(update={"expected": replacement}),)}))
+            # Every check is carried through; only the one the question names is
+            # revised. Rebuilding from a single check would drop the others.
+            revised.append(
+                spec.replace(
+                    checks=tuple(
+                        check.replace(expected=_parse_expected(value, check.expected))
+                        if check.check_id == question.check_id
+                        else check
+                        for check in spec.checks
+                    )
+                )
+            )
         else:
             additions = (value.strip(),) if value.strip() else ()
             revised.append(
-                spec.model_copy(
-                    update={question.field: getattr(spec, question.field) + additions}
-                )
+                spec.replace(**{question.field: getattr(spec, question.field) + additions})
             )
 
     index = interview.next_question_index + 1
-    draft = interview.draft.model_copy(update={"verifiers": tuple(revised)})
-    return interview.model_copy(
-        update={
-            "draft": draft,
-            "answers": interview.answers
-            + (InterviewAnswer(question_id=question.question_id, value=value),),
-            "next_question_index": index,
-            "complete": index == len(interview.questions),
-        }
+    return interview.replace(
+        draft=interview.draft.replace(verifiers=tuple(revised)),
+        answers=interview.answers
+        + (InterviewAnswer(question_id=question.question_id, value=value),),
+        next_question_index=index,
+        complete=index == len(interview.questions),
     )
 
 

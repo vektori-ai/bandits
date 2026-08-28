@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from pydantic import Field, model_validator
 
+from bandits.analyze.models import EvidenceKind, kind_rank
 from bandits.traces import Contract
 
 
@@ -28,8 +29,27 @@ class VerifierStatus(str, Enum):
 
 class CheckOperator(str, Enum):
     EQUALS = "equals"
+    """A named state field or recorded score equals a fixed value."""
+
     EXIT_CODE_ZERO = "exit_code_zero"
     EXACT_OUTPUT = "exact_output"
+
+    STATE_INVARIANT = "state_invariant"
+    """A terminal field agrees with the initial state it is derived from.
+
+    The check a single field cannot express: that a refund matched what was
+    charged, rather than merely that a refund happened.
+    """
+
+    NO_SPAN_ERROR = "no_span_error"
+    """Nothing in the episode reported an error."""
+
+    RUBRIC_AT_LEAST = "rubric_at_least"
+    """A model judge scored the run at or above a threshold.
+
+    The only operator that can reach a family recording no structured state.
+    Its evidence is a judgement, not an observation, and ranks accordingly.
+    """
 
 
 class CheckSpec(Contract):
@@ -40,6 +60,13 @@ class CheckSpec(Contract):
     weight: float = Field(default=1.0, gt=0)
     supporting_evidence_ids: tuple[str, ...]
     description: str
+
+    evidence_kind: EvidenceKind = EvidenceKind.OBSERVED_TRACE
+    """The trust class of the evidence this check reads.
+
+    Recorded on the check so a verifier's standing can be judged from the spec
+    alone, without re-deriving it from whichever traces happened to support it.
+    """
 
 
 class VerifierSpec(Contract):
@@ -58,10 +85,29 @@ class VerifierSpec(Contract):
     validation_artifact_id: str | None = None
     human_acceptance_id: str | None = None
 
+    @property
+    def rests_only_on_self_report(self) -> bool:
+        """True when nothing but the agent's own claim supports this verifier."""
+        return all(check.evidence_kind is EvidenceKind.AGENT_SELF_REPORT for check in self.checks)
+
+    @property
+    def weakest_evidence_kind(self) -> EvidenceKind:
+        return min((check.evidence_kind for check in self.checks), key=kind_rank)
+
     @model_validator(mode="after")
     def validate_lifecycle(self) -> VerifierSpec:
         if not self.checks:
             raise ValueError("a verifier must contain at least one check")
+        if self.rests_only_on_self_report and self.status in {
+            VerifierStatus.CALIBRATED,
+            VerifierStatus.REVIEWED,
+        }:
+            # The agent asserting it finished is never sufficient on its own. A
+            # check reading only that may be drafted and run, so its disagreement
+            # with better evidence stays visible, but it can never be promoted.
+            raise ValueError(
+                f"{self.status.value} requires evidence stronger than agent self-report"
+            )
         if self.mode is VerifierMode.REPLAY and any(i.startswith("live:") for i in self.inputs):
             raise ValueError("a replay verifier cannot declare a live input")
         if self.status in {VerifierStatus.CALIBRATED, VerifierStatus.REVIEWED}:
@@ -87,9 +133,17 @@ class Result(Contract):
 
     @model_validator(mode="after")
     def unknown_is_consistent(self) -> Result:
+        """Fail closed on the aggregate, but never at the cost of the breakdown.
+
+        An unknown aggregate may — and should — carry known subscores. Which
+        checks passed while another was unscorable is the whole record of how a
+        verifier behaved, and it is what reward-hacking analysis reads.
+        """
+        if not self.subscores:
+            raise ValueError("a result must contain at least one subscore")
         known = [part.score for part in self.subscores if part.score is not None]
-        if self.score is None and known:
-            raise ValueError("an unknown aggregate cannot contain known subscores")
+        if self.score is not None and len(known) != len(self.subscores):
+            raise ValueError("a known aggregate cannot contain an unknown subscore")
         if self.score is not None and not known:
             raise ValueError("a known aggregate requires at least one known subscore")
         return self
@@ -120,6 +174,19 @@ class InterviewQuestion(Contract):
     field: Literal["expected", "blind_spots", "gaming_hypotheses"]
     prompt: str
     current_value: Any = None
+
+    check_id: str | None = None
+    """Which check an ``expected`` answer revises. Required for that field.
+
+    Without it a revision could only ever address one check, and answering a
+    question would silently discard the rest of a composite verifier.
+    """
+
+    @model_validator(mode="after")
+    def check_is_targeted(self) -> InterviewQuestion:
+        if self.field == "expected" and not self.check_id:
+            raise ValueError("an expected-value question must name the check it revises")
+        return self
 
 
 class InterviewAnswer(Contract):

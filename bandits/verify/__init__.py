@@ -28,9 +28,25 @@ from bandits.verify.models import (
     VerifierSpec,
     VerifierStatus,
 )
+from bandits.verify.run import (
+    Disagreement,
+    DraftRun,
+    TraceOutcome,
+    compute_run_id,
+    load_draft_run,
+    run_draft,
+    save_draft_run,
+)
 
 __all__ = [
     "CheckOperator",
+    "Disagreement",
+    "DraftRun",
+    "TraceOutcome",
+    "compute_run_id",
+    "load_draft_run",
+    "run_draft",
+    "save_draft_run",
     "CheckSpec",
     "InterviewAnswer",
     "InterviewQuestion",
