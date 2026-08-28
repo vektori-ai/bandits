@@ -15,6 +15,18 @@ from bandits.verify.interview import (
     save_interview,
     start_interview,
 )
+from bandits.verify.judge import (
+    JudgeError,
+    JudgeRun,
+    JudgeVerdict,
+    PromptDigestMismatch,
+    Rubric,
+    judge_trace,
+    judge_traces,
+    load_judge_run,
+    render_transcript,
+    save_judge_run,
+)
 from bandits.verify.models import (
     CheckOperator,
     CheckSpec,
@@ -39,6 +51,16 @@ from bandits.verify.run import (
 )
 
 __all__ = [
+    "JudgeError",
+    "JudgeRun",
+    "JudgeVerdict",
+    "PromptDigestMismatch",
+    "Rubric",
+    "judge_trace",
+    "judge_traces",
+    "load_judge_run",
+    "render_transcript",
+    "save_judge_run",
     "CheckOperator",
     "Disagreement",
     "DraftRun",
