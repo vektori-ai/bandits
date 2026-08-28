@@ -189,9 +189,18 @@ class CorpusAnalysis(Contract):
 _SLUG_UNSAFE = re.compile(r"[^a-z0-9]+")
 
 
-def evidence_id(*, trace_id: str, claim: str, span_id: str | None = None) -> str:
-    """Deterministic id, so re-analyzing the same corpus lands on the same ids."""
+def evidence_id(
+    *, trace_id: str, claim: str, span_id: str | None = None, detail: str | None = None
+) -> str:
+    """Deterministic id, so re-analyzing the same corpus lands on the same ids.
+
+    ``detail`` separates several facts of the same claim on one span — one span
+    reporting both an amount and a status is two pieces of evidence, not one
+    overwriting the other.
+    """
     parts = [trace_id, span_id or "trace", claim]
+    if detail is not None:
+        parts.append(detail)
     slug = _SLUG_UNSAFE.sub("-", "-".join(parts).lower()).strip("-")
     return f"ev-{slug}"
 

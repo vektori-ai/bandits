@@ -250,7 +250,7 @@ def test_interview_verifier_completes_a_bounded_review(tmp_path) -> None:
     result = runner.invoke(
         app,
         ["interview-verifier", draft_id, "--project", str(tmp_path)],
-        input="\namount may differ\nstatus can be written directly\n",
+        input="\n" * 60,
     )
 
     assert result.exit_code == 0, result.stdout
@@ -262,7 +262,7 @@ def test_interview_verifier_completes_a_bounded_review(tmp_path) -> None:
     )
     interview = load_interview(interview_id, store)
     assert interview.complete
-    assert len(interview.answers) == 3
+    assert len(interview.answers) == len(interview.questions)
     assert interview.draft.verifiers[0].status.value == "executable"
 
 
@@ -284,7 +284,7 @@ def test_draft_verifier_can_run_the_interview_inline(tmp_path) -> None:
             "--project",
             str(tmp_path),
         ],
-        input="\n\n\n",
+        input="\n" * 60,
     )
 
     assert result.exit_code == 0, result.stdout

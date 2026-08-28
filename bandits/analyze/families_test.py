@@ -104,7 +104,10 @@ def test_mutual_knn_avoids_a_plain_single_link_chain() -> None:
 
     clusters = _cluster(features, similarity=0.6, neighbors=1, distance=jaccard_distance)
 
-    assert sorted(sorted(f.trace_id for f in cluster) for cluster in clusters) == [["a", "b"], ["c"]]
+    assert sorted(sorted(f.trace_id for f in cluster) for cluster in clusters) == [
+        ["a", "b"],
+        ["c"],
+    ]
 
 
 def test_medoid_work_scales_with_distinct_descriptors() -> None:

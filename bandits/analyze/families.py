@@ -16,6 +16,7 @@ import math
 import re
 from collections import Counter
 from collections.abc import Callable
+from typing import Literal
 
 from bandits.analyze.models import (
     CorpusAnalysis,
@@ -92,15 +93,26 @@ def _tokens(normalized: str) -> frozenset[str]:
     return frozenset(normalized.split())
 
 
-Distance = Callable[[frozenset[str], frozenset[str]], float]
+Distance = Callable[[str, str], float]
+"""How far apart two normalized instructions are, in [0, 1].
+
+Takes the descriptors rather than their tokens so that a backend measuring
+meaning rather than overlap can implement it.
+"""
 
 
-def jaccard_distance(left: frozenset[str], right: frozenset[str]) -> float:
-    """Jaccard distance. Two empty instructions are identical, not infinitely far."""
-    if not left and not right:
+def jaccard_distance(left: str, right: str) -> float:
+    """Token overlap. Two empty instructions are identical, not infinitely far.
+
+    Cheap, offline and reproducible, and blind to paraphrase: "bro login in aws"
+    and "can you login to the aws thing" share two tokens of fifteen, which reads
+    as unrelated. Real corpora need an embedding backend to group at all.
+    """
+    left_tokens, right_tokens = _tokens(left), _tokens(right)
+    if not left_tokens and not right_tokens:
         return 0.0
-    union = left | right
-    return 1.0 - (len(left & right) / len(union)) if union else 0.0
+    union = left_tokens | right_tokens
+    return 1.0 - (len(left_tokens & right_tokens) / len(union)) if union else 0.0
 
 
 def _stable_fraction(*parts: str) -> float:
@@ -131,7 +143,6 @@ class _TraceFeatures:
         "lineage_id",
         "instruction",
         "normalized",
-        "tokens",
         "tools",
         "span_count",
         "has_failure",
@@ -153,7 +164,6 @@ class _TraceFeatures:
         self.lineage_id = lineage_id
         self.instruction = instruction
         self.normalized = normalize_instruction(instruction)
-        self.tokens = _tokens(self.normalized)
         self.tools = tools
         self.span_count = span_count
         self.has_failure = has_failure
@@ -226,12 +236,11 @@ def _cluster(
 
     descriptors = sorted(exact)
     max_distance = 1.0 - similarity
-    tokenized = {descriptor: _tokens(descriptor) for descriptor in descriptors}
     nearest: dict[str, set[str]] = {}
     for descriptor in descriptors:
         ranked = sorted(
             (
-                (distance(tokenized[descriptor], tokenized[other]), other)
+                (distance(descriptor, other), other)
                 for other in descriptors
                 if other != descriptor
             ),
@@ -264,12 +273,12 @@ def _cluster(
                     pending.append(other)
         components.append(sorted(component))
 
-    return [[feature for descriptor in group for feature in exact[descriptor]] for group in components]
+    return [
+        [feature for descriptor in group for feature in exact[descriptor]] for group in components
+    ]
 
 
-def _medoid(
-    members: list[_TraceFeatures], distance: Distance = jaccard_distance
-) -> str:
+def _medoid(members: list[_TraceFeatures], distance: Distance = jaccard_distance) -> str:
     """Find the exact weighted medoid over distinct descriptors, not every trace."""
     by_descriptor: dict[str, list[_TraceFeatures]] = {}
     for member in members:
@@ -283,7 +292,7 @@ def _medoid(
         by_descriptor,
         key=lambda candidate: (
             sum(
-                distance(representatives[candidate].tokens, representatives[other].tokens)
+                distance(representatives[candidate].normalized, representatives[other].normalized)
                 * len(group)
                 for other, group in by_descriptor.items()
             ),
@@ -361,7 +370,7 @@ def _farthest_first(
             remaining,
             key=lambda candidate: (
                 min(
-                    (distance(candidate.tokens, other.tokens) for other in selected),
+                    (distance(candidate.normalized, other.normalized) for other in selected),
                     default=1.0,
                 ),
                 candidate.trace_id,
@@ -383,6 +392,7 @@ def mine_task_set(
     neighbors: int = DEFAULT_NEIGHBORS,
     tail_reserve: float = DEFAULT_TAIL_RESERVE,
     distance: Distance = jaccard_distance,
+    proposed_by: Literal["rule", "model", "human"] = "rule",
 ) -> TaskSet:
     """Group an analysis into families and select a set that stands for the workload."""
     features, ungroupable = _features(analysis)
@@ -420,6 +430,7 @@ def mine_task_set(
                 workload_mass=len(members),
                 fit_trace_ids=fit,
                 held_out_trace_ids=held,
+                proposed_by=proposed_by,
                 limitations=tuple(limitations),
             )
         )
@@ -639,14 +650,14 @@ def _rebuild(
     )
     represented = {s.family_id for s in selected}
     covered = sum(f.workload_mass for f in families if f.family_id in represented)
-    return task_set.model_copy(
-        update={
-            "families": families,
-            "selected": selected,
-            "workload_coverage": (
-                covered / task_set.total_workload_mass if task_set.total_workload_mass else 0.0
-            ),
-        }
+    # replace(), not model_copy(): a correction that broke a family invariant
+    # would otherwise be written to the store and only fail on the next read.
+    return task_set.replace(
+        families=families,
+        selected=selected,
+        workload_coverage=(
+            covered / task_set.total_workload_mass if task_set.total_workload_mass else 0.0
+        ),
     )
 
 

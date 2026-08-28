@@ -20,7 +20,8 @@ _EXIT_CODE_KEYS = ("exit_code", "exitcode", "returncode", "return_code")
 _SCORE_KEYS = ("score", "rating", "feedback", "user_feedback", "evaluation")
 """Keys under which a source may have recorded its own judgement of the run."""
 
-_STATE_KEYS = ("status", "state")
+_SCALAR = (str, int, float, bool)
+"""Only scalars become state fields. A nested object is not a comparable value."""
 
 
 def _evidence(
@@ -32,10 +33,11 @@ def _evidence(
     visibility: Visibility,
     strength: str,
     kind: EvidenceKind = EvidenceKind.OBSERVED_TRACE,
+    detail: str | None = None,
 ) -> Evidence:
     span_id = span.span_id if span is not None else None
     return Evidence(
-        evidence_id=evidence_id(trace_id=trace_id, claim=claim, span_id=span_id),
+        evidence_id=evidence_id(trace_id=trace_id, claim=claim, span_id=span_id, detail=detail),
         claim=claim,
         value=value,
         visibility=visibility,
@@ -56,10 +58,24 @@ def _first_key(payload: Any, keys: tuple[str, ...]) -> tuple[str, Any] | None:
     return None
 
 
+def _scalar_fields(payload: Any) -> list[tuple[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    return [(key, value) for key, value in sorted(payload.items()) if isinstance(value, _SCALAR)]
+
+
 def extract_outcome_evidence(trace: Trace) -> tuple[Evidence, ...]:
     """Collect every recorded signal about how this episode went."""
     found: dict[str, Evidence] = {}
     terminal_ids = {span.span_id for span in terminal_spans(trace.spans)}
+    first_tool_span_id = next(
+        (span.span_id for span in trace.spans if span.kind is SpanKind.TOOL), None
+    )
+    if first_tool_span_id in terminal_ids:
+        # A single-tool episode has no "before". Recording its one result as both
+        # initial and final state would make every invariant over it compare a
+        # value to itself and pass for free.
+        first_tool_span_id = None
 
     def record(evidence: Evidence) -> None:
         found.setdefault(evidence.evidence_id, evidence)
@@ -114,15 +130,37 @@ def extract_outcome_evidence(trace: Trace) -> tuple[Evidence, ...]:
             )
 
         if span.kind is SpanKind.TOOL and is_terminal:
-            state = _first_key(span.output, _STATE_KEYS)
-            if state is not None:
+            # Every scalar the terminal tool reported, not just its status. A
+            # check comparing an amount against what was charged needs the
+            # amount, and recording only one field per span made the whole
+            # class of before/after invariants impossible to express.
+            for key, value in _scalar_fields(span.output):
                 record(
                     _evidence(
                         span,
                         trace_id=trace.trace_id,
                         claim="final_state_field",
-                        value={"key": state[0], "value": state[1], "tool": span.name},
+                        detail=key,
+                        value={"key": key, "value": value, "tool": span.name},
                         visibility=Visibility.TERMINAL,
+                        strength="moderate",
+                        kind=EvidenceKind.STRUCTURED_EXTERNAL_RESULT,
+                    )
+                )
+
+        if span.kind is SpanKind.TOOL and span.span_id == first_tool_span_id:
+            # The state the episode started from, as the first tool observed it.
+            # Knowable only during the run, never at_start: the agent had to call
+            # a tool to learn it, so a prompt may not contain it.
+            for key, value in _scalar_fields(span.output):
+                record(
+                    _evidence(
+                        span,
+                        trace_id=trace.trace_id,
+                        claim="initial_state_field",
+                        detail=key,
+                        value={"key": key, "value": value, "tool": span.name},
+                        visibility=Visibility.DURING,
                         strength="moderate",
                         kind=EvidenceKind.STRUCTURED_EXTERNAL_RESULT,
                     )

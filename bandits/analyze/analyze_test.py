@@ -200,3 +200,49 @@ def test_recorded_score_outranks_the_agents_own_claim() -> None:
 
     assert evidence["recorded_score"].kind is EvidenceKind.TRUSTED_EVALUATOR
     assert evidence["recorded_score"].trust_rank > evidence["final_output"].trust_rank
+
+
+def test_initial_and_terminal_state_are_both_extracted() -> None:
+    """The before/after pair is what makes a non-trivial verifier possible."""
+    corpus = load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp")
+    trace = next(t for t in corpus.traces if t.trace_id == "refund-1")
+
+    evidence = extract_outcome_evidence(trace)
+    initial = {
+        e.value["key"]: e.value["value"] for e in evidence if e.claim == "initial_state_field"
+    }
+    final = {e.value["key"]: e.value["value"] for e in evidence if e.claim == "final_state_field"}
+
+    assert initial["charged_amount"] == 48.0
+    assert final["refunded_amount"] == 48.0
+    assert final["status"] == "refunded"
+
+
+def test_every_scalar_of_the_terminal_tool_is_recorded_not_just_status() -> None:
+    corpus = load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp")
+    trace = next(t for t in corpus.traces if t.trace_id == "refund-1")
+
+    keys = {
+        e.value["key"] for e in extract_outcome_evidence(trace) if e.claim == "final_state_field"
+    }
+
+    assert keys == {"status", "refunded_amount"}
+
+
+def test_a_single_tool_episode_has_no_initial_state() -> None:
+    """Its one result is the terminal state; calling it 'initial' too is vacuous."""
+    corpus = load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp")
+    trace = next(t for t in corpus.traces if t.trace_id == "cancel-1")
+
+    evidence = extract_outcome_evidence(trace)
+
+    assert not [e for e in evidence if e.claim == "initial_state_field"]
+    assert [e for e in evidence if e.claim == "final_state_field"]
+
+
+def test_span_order_breaks_ties_on_source_order_not_span_id() -> None:
+    """addr-1 stamps every span with one timestamp; 's10' must not sort before 's2'."""
+    corpus = load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp")
+    trace = next(t for t in corpus.traces if t.trace_id == "addr-1")
+
+    assert trace.spans[-1].name == "override_address_policy"

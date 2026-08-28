@@ -25,9 +25,7 @@ def analyze_corpus(corpus: TraceCorpus) -> CorpusAnalysis:
         task, task_evidence = extract_task(trace)
         outcome_evidence = extract_outcome_evidence(trace)
         tasks.append(
-            task.model_copy(
-                update={"outcome_evidence_ids": tuple(e.evidence_id for e in outcome_evidence)}
-            )
+            task.replace(outcome_evidence_ids=tuple(e.evidence_id for e in outcome_evidence))
         )
         evidence.extend(task_evidence)
         evidence.extend(outcome_evidence)
