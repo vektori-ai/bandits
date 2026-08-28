@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import time
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from bandits.cli import app
@@ -56,7 +59,7 @@ def test_location_survives_an_earlier_multiline_replacement(tmp_path: Path) -> N
     """A private key collapsing ten lines must not shift what comes after it."""
     source = tmp_path / "trace.jsonl"
     key = "-----BEGIN PRIVATE KEY-----\n" + "MIIBVgIBADANBgkq\n" * 8 + "-----END PRIVATE KEY-----"
-    source.write_text(f"{key}\nfiller\ncontact alice@example.com\n")
+    source.write_text(f"{key}\nfiller\ncontact alice@realmail.io\n")
 
     issues = redact_source(source).issues
 
@@ -88,18 +91,18 @@ def test_overlapping_rules_replace_a_value_once(tmp_path: Path) -> None:
 def test_secrets_only_ruleset_keeps_a_task_identifying_email(tmp_path: Path) -> None:
     """An email is often the task's own identifier; removing it can void the task."""
     source = tmp_path / "trace.jsonl"
-    source.write_text(_otlp("Refund the order for alice@example.com"))
+    source.write_text(_otlp("Refund the order for alice@realmail.io"))
 
     corpus = load_corpus(source, "otlp", SECRETS_ONLY_RULESET)
 
-    assert corpus.traces[0].task == "Refund the order for alice@example.com"
+    assert corpus.traces[0].task == "Refund the order for alice@realmail.io"
     assert corpus.redaction_ruleset == "secrets-only-v1"
     assert load_corpus(source, "otlp").redaction_ruleset == "default-v1"
 
 
 def test_ingest_records_the_ruleset_that_produced_the_corpus(tmp_path: Path) -> None:
     source = tmp_path / "trace.jsonl"
-    source.write_text(_otlp("Refund the order for alice@example.com"))
+    source.write_text(_otlp("Refund the order for alice@realmail.io"))
     project = tmp_path / "project"
 
     result = runner.invoke(
@@ -145,3 +148,52 @@ def test_unknown_ruleset_exits_nonzero(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 1
+
+
+def test_redaction_never_orphans_a_json_escape(tmp_path: Path) -> None:
+    """`\\n@pytest.mark.x` offers `n@pytest.mark.x` as a well-formed address.
+
+    Consuming its leading `n` leaves the backslash glued to the marker, which is
+    an invalid escape, and the whole record is lost rather than merely redacted.
+    Measured on a real session log: ten records destroyed this way.
+    """
+    source = tmp_path / "trace.jsonl"
+    source.write_text(json.dumps({"text": "assert x == 1\n\n@pytest.mark.parametrize(\n"}) + "\n")
+
+    result = redact_source(source)
+
+    json.loads(result.data.decode())
+    assert b"@pytest.mark.parametrize" in result.data
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["git@github.com", "noreply@anthropic.com", "agent@example.com", "root@localhost"],
+)
+def test_role_addresses_and_reserved_domains_are_not_personal(tmp_path: Path, address: str) -> None:
+    """Redacting a git remote destroys a real fact and protects nobody."""
+    source = tmp_path / "trace.jsonl"
+    source.write_text(_otlp(f"Push to {address}"))
+
+    assert address.encode() in redact_source(source).data
+
+
+def test_a_real_address_is_still_redacted(tmp_path: Path) -> None:
+    source = tmp_path / "trace.jsonl"
+    source.write_text(_otlp("Mail alice.smith@realmail.io about it"))
+
+    result = redact_source(source)
+
+    assert b"alice.smith@realmail.io" not in result.data
+    assert b"[REDACTED:email_address]" in result.data
+
+
+def test_a_long_dotted_run_does_not_backtrack(tmp_path: Path) -> None:
+    """This pattern once spent 85 seconds on a 20 MB file before matching nothing."""
+    source = tmp_path / "trace.jsonl"
+    source.write_text("a" + ".a" * 4000 + "@" + "b" * 200 + "\n")
+
+    started = time.monotonic()
+    redact_source(source)
+
+    assert time.monotonic() - started < 2.0

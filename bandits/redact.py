@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +31,13 @@ class Rule:
     kind: str
     pattern: re.Pattern[bytes]
     group: int = 0
+    accept: Callable[[re.Match[bytes]], bool] | None = None
+    """Optional check applied after matching.
+
+    Judgement that would make a pattern ambiguous belongs here instead. Encoding
+    it in the regex is how a rule ends up backtracking for a minute and a half
+    over a large file before matching nothing at all.
+    """
 
 
 @dataclass(frozen=True)
@@ -63,9 +71,35 @@ _PRIVATE_KEY = Rule(
 _BEARER_TOKEN = Rule("bearer_token", re.compile(rb"(?i)Bearer\s+[A-Za-z0-9._~+/=-]{12,}"))
 _OPENAI_KEY = Rule("openai_api_key", re.compile(rb"\bsk-[A-Za-z0-9_-]{12,}\b"))
 _AWS_KEY = Rule("aws_access_key", re.compile(rb"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"))
+_ROLE_LOCALS = frozenset({b"git", b"noreply", b"no-reply", b"donotreply", b"do-not-reply"})
+_RESERVED_DOMAINS = (b"example.com", b"example.org", b"example.net", b"localhost")
+
+
+def _is_personal_address(match: re.Match[bytes]) -> bool:
+    """Reject role addresses, reserved domains, and anything without a real TLD.
+
+    Measured on a real 20 MB session log: without this, the rule matched 64
+    times, of which 4 were actual addresses. The rest were git remotes, doc
+    examples, and Python decorators.
+    """
+    local, _, domain = match.group().partition(b"@")
+    if local.lower() in _ROLE_LOCALS or domain.lower().endswith(_RESERVED_DOMAINS):
+        return False
+    tld = domain.rpartition(b".")[2]
+    return 2 <= len(tld) <= 24 and tld.isalpha()
+
+
 _EMAIL = Rule(
     "email_address",
-    re.compile(rb"\b[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\b"),
+    # Possessive quantifiers throughout: a dotted run in source code otherwise
+    # offers this pattern exponentially many ways to split, and it spends them.
+    # Not preceded by a backslash either — inside JSON, "\n@pytest.mark.x" offers
+    # "n@pytest.mark.x" as a well-formed address, and consuming that leading "n"
+    # orphans the escape and destroys the whole record.
+    re.compile(
+        rb"(?<![\\A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}+@[A-Za-z0-9-]{1,63}+(?:\.[A-Za-z0-9-]{1,63}+)++"
+    ),
+    accept=_is_personal_address,
 )
 
 # The value runs to its closing quote rather than to the first space: a secret
@@ -110,6 +144,11 @@ def _matches(data: bytes, ruleset: RedactionRuleset) -> list[tuple[int, int, str
         for rule in ruleset.rules
         for match in rule.pattern.finditer(data)
         if match.span(rule.group) != (-1, -1)
+        and (rule.accept is None or rule.accept(match))
+        # A replacement starting one byte after a backslash leaves that backslash
+        # attached to the marker. In JSON that is an invalid escape, and the
+        # record carrying it is lost entirely rather than merely redacted.
+        and not _follows_escape(data, match.span(rule.group)[0])
     ]
     # Longest match wins where two rules overlap, so a key inside a larger
     # credential block is not replaced twice or split in half.
@@ -122,6 +161,10 @@ def _matches(data: bytes, ruleset: RedactionRuleset) -> list[tuple[int, int, str
             kept.append((start, end, kind))
             last_end = end
     return kept
+
+
+def _follows_escape(data: bytes, start: int) -> bool:
+    return start > 0 and data[start - 1 : start] == b"\\"
 
 
 def redact_source(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> RedactedSource:

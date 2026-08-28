@@ -10,15 +10,17 @@ from __future__ import annotations
 from pathlib import Path
 
 from bandits.ingest.chat_json import load_chat_json
+from bandits.ingest.claude_code import load_claude_code
 from bandits.ingest.otlp import load_otlp
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset
 from bandits.traces import TraceCorpus
 
-CANONICAL_SOURCES: tuple[str, ...] = ("otlp", "chat-json")
+CANONICAL_SOURCES: tuple[str, ...] = ("otlp", "chat-json", "claude-code")
 
 _LOADERS = {
     "otlp": load_otlp,
     "chat-json": load_chat_json,
+    "claude-code": load_claude_code,
 }
 
 

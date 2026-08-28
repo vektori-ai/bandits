@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,6 +18,15 @@ class Contract(BaseModel):
     """Base for every model in this module: immutable, no silent extra fields."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+    def replace(self, **updates: Any) -> Self:
+        """Copy with changes, re-running validators.
+
+        ``model_copy`` skips validation entirely, so every invariant these models
+        declare would hold at construction and then quietly stop holding the
+        first time a correction edited one.
+        """
+        return type(self).model_validate({**self.model_dump(), **updates})
 
 
 class SpanKind(str, Enum):

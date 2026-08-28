@@ -143,7 +143,7 @@ def load_otlp(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> TraceC
     raw = source.data
     source_digest = source.source_digest
 
-    spans_by_trace: dict[str, list[Span]] = {}
+    spans_by_trace: dict[str, list[tuple[int, Span]]] = {}
     task_by_trace: dict[str, str] = {}
     lineage_by_trace: dict[str, str] = {}
     issues: list[TraceIssue] = list(source.issues)
@@ -173,7 +173,7 @@ def load_otlp(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> TraceC
                 TraceIssue(kind="malformed_span", detail=exc.detail, location=exc.location)
             )
             continue
-        spans_by_trace.setdefault(trace_id, []).append(span)
+        spans_by_trace.setdefault(trace_id, []).append((index, span))
         if task is not None:
             task_by_trace[trace_id] = task
         if lineage_id is not None:
@@ -186,7 +186,13 @@ def load_otlp(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> TraceC
             source_digest=source_digest,
             task=task_by_trace.get(trace_id),
             lineage_id=lineage_by_trace.get(trace_id),
-            spans=tuple(sorted(spans, key=lambda s: (s.started_at, s.span_id))),
+            # Source order breaks ties, not span_id: exporters often stamp a
+            # whole episode with one coarse timestamp, and sorting those
+            # lexicographically puts 's10' before 's2' and picks the wrong
+            # terminal span.
+            spans=tuple(
+                span for _, span in sorted(spans, key=lambda pair: (pair[1].started_at, pair[0]))
+            ),
         )
         for trace_id, spans in sorted(spans_by_trace.items())
     )
