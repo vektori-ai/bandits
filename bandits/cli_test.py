@@ -90,6 +90,9 @@ def test_analyze_unknown_artifact_exits_nonzero(tmp_path) -> None:
     assert result.exit_code == 1
 
 
+_BLANK_ANSWERS = "\n" * 60
+"""Enough blank answers to walk any draft's interview to completion."""
+
 SUPPORT_FIXTURE = (
     Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "traces.support.otlp.jsonl"
 )
@@ -250,7 +253,7 @@ def test_interview_verifier_completes_a_bounded_review(tmp_path) -> None:
     result = runner.invoke(
         app,
         ["interview-verifier", draft_id, "--project", str(tmp_path)],
-        input="\n" * 60,
+        input=_BLANK_ANSWERS,
     )
 
     assert result.exit_code == 0, result.stdout
@@ -263,6 +266,13 @@ def test_interview_verifier_completes_a_bounded_review(tmp_path) -> None:
     interview = load_interview(interview_id, store)
     assert interview.complete
     assert len(interview.answers) == len(interview.questions)
+    # Blind spots and gaming are asked of every check; an expected value only of
+    # the checks that compare against one.
+    assert all(
+        question.check_id is not None
+        for question in interview.questions
+        if question.field == "expected"
+    )
     assert interview.draft.verifiers[0].status.value == "executable"
 
 
@@ -284,10 +294,102 @@ def test_draft_verifier_can_run_the_interview_inline(tmp_path) -> None:
             "--project",
             str(tmp_path),
         ],
-        input="\n" * 60,
+        input=_BLANK_ANSWERS,
     )
 
     assert result.exit_code == 0, result.stdout
     assert "verifier_draft_id:" in result.stdout
     assert "interview_id:" in result.stdout
     assert "status:       complete" in result.stdout
+
+
+def _drafted_family(tmp_path, descriptor_word: str) -> tuple[str, str]:
+    """Ingest, analyze, mine and draft; return (draft_id, family_id)."""
+    task_set_id = _mined(tmp_path)
+    store = DerivedStore(tmp_path / ".bandits")
+    family = next(
+        f for f in load_task_set(task_set_id, store).families if descriptor_word in f.descriptor
+    )
+    drafted = runner.invoke(
+        app,
+        # fmt: off
+        [
+            "draft-verifier",
+            task_set_id,
+            "--family",
+            family.family_id,
+            "--project",
+            str(tmp_path),
+        ],
+        # fmt: on
+    )
+    assert drafted.exit_code == 0, drafted.stdout
+    return drafted.stdout.split()[1], family.family_id
+
+
+def test_label_then_validate_separates_the_right_check(tmp_path) -> None:
+    """addr-1 changed the address; addr-2 and addr-3 only looked the order up."""
+    draft_id, _ = _drafted_family(tmp_path, "address")
+
+    labelled = runner.invoke(
+        app,
+        ["label", draft_id, "--labeler", "owner", "--project", str(tmp_path)],
+        input="s\nchanged it\nf\nonly looked\nf\nonly looked\n",
+    )
+    assert labelled.exit_code == 0, labelled.stdout
+    label_set_id = labelled.stdout.split("label_set_id:")[1].split()[0]
+
+    result = runner.invoke(
+        app,
+        # fmt: off
+        [
+            "validate-verifier",
+            draft_id,
+            "--labels",
+            label_set_id,
+            "--project",
+            str(tmp_path),
+        ],
+        # fmt: on
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "validation_id: validation-" in result.stdout
+    # One hypothesis is right and one is wrong; the run where the wrong one
+    # would have rewarded doing nothing is named.
+    assert "100%" in result.stdout and "0%" in result.stdout
+    assert "false_positive" in result.stdout
+    assert "gamed" in result.stdout
+
+
+def test_labeling_can_be_quit_early(tmp_path) -> None:
+    draft_id, _ = _drafted_family(tmp_path, "address")
+
+    result = runner.invoke(
+        app,
+        ["label", draft_id, "--labeler", "owner", "--project", str(tmp_path)],
+        input="s\nfine\nq\n",
+    )
+
+    assert result.exit_code == 0
+    assert "labels:       1" in result.stdout
+
+
+def test_validate_verifier_needs_an_existing_label_set(tmp_path) -> None:
+    draft_id, _ = _drafted_family(tmp_path, "address")
+
+    result = runner.invoke(
+        app,
+        # fmt: off
+        [
+            "validate-verifier",
+            draft_id,
+            "--labels",
+            "labels-nope",
+            "--project",
+            str(tmp_path),
+        ],
+        # fmt: on
+    )
+
+    assert result.exit_code == 1

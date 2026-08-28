@@ -23,6 +23,13 @@ from bandits.analyze import (
     split_family,
 )
 from bandits.ingest import CANONICAL_SOURCES, UnknownSourceError, load_corpus
+from bandits.labels import (
+    LabelSet,
+    Verdict,
+    load_label_set,
+    make_label,
+    save_label_set,
+)
 from bandits.redact import DEFAULT_RULESET, ruleset_by_name
 from bandits.store import ArtifactStore, DerivedStore
 from bandits.verify import (
@@ -30,9 +37,21 @@ from bandits.verify import (
     draft_verifiers,
     load_verifier_draft,
     next_question,
+    run_draft,
+    save_draft_run,
     save_interview,
     save_verifier_draft,
     start_interview,
+)
+from bandits.verify.judge import (
+    JudgeError,
+    Rubric,
+    judge_traces,
+    save_judge_run,
+)
+from bandits.verify.validate import (
+    save_validation,
+    validate_draft,
 )
 
 app = typer.Typer(add_completion=False)
@@ -352,24 +371,63 @@ def draft_verifier_command(
     console.print(f"family:            {draft.family_id}")
     console.print(f"verifiers:         {len(draft.verifiers)}")
 
-    table = Table("verifier_id", "mode", "status", "check", "expected")
+    table = Table("verifier_id", "mode", "status", "check", "expected", "evidence")
     for spec in draft.verifiers:
-        check = spec.checks[0]
-        table.add_row(
-            spec.verifier_id,
-            spec.mode.value,
-            spec.status.value,
-            check.claim,
-            repr(check.expected),
-        )
+        for index, check in enumerate(spec.checks):
+            table.add_row(
+                spec.verifier_id if index == 0 else "",
+                spec.mode.value if index == 0 else "",
+                spec.status.value if index == 0 else "",
+                check.claim,
+                repr(check.expected),
+                check.evidence_kind.value,
+            )
     console.print(table)
     for unresolved in draft.unresolved:
         console.print(f"[yellow]unresolved:[/yellow] {unresolved}")
+
+    # A drafted check is a hypothesis. Run it before anyone is asked about it.
+    run = run_draft(draft, analysis, task_set)
+    save_draft_run(run, store)
+    _show_draft_run(run)
+
     if interview:
         _run_verifier_interview(draft, envelope.artifact_id, store)
 
 
-def _run_verifier_interview(draft, verifier_draft_id: str, store: DerivedStore) -> None:
+def _show_draft_run(run) -> None:
+    """Put results in front of the owner before asking them to review the check."""
+    console.print(
+        f"\nscored {len({o.trace_id for o in run.outcomes})} historical run(s) "
+        f"with {len({o.verifier_id for o in run.outcomes})} verifier(s)"
+    )
+
+    if run.disagreements:
+        table = Table("trace_id", "kind", "scores")
+        for item in run.disagreements:
+            scores = ", ".join(
+                f"{vid[:20]}={'unknown' if score is None else score}"
+                for vid, score in sorted(item.scores.items())
+            )
+            table.add_row(item.trace_id, item.kind, scores)
+        console.print(table)
+        console.print(
+            "[yellow]these runs are where labeling pays[/yellow]: the verifiers "
+            "split on them, so one label resolves all of them at once"
+        )
+    else:
+        console.print("no verifier disagreed with another on any scored run")
+
+    if run.unscorable_trace_ids:
+        console.print(
+            f"[yellow]unscorable:[/yellow] {len(run.unscorable_trace_ids)} run(s) recorded no "
+            "evidence any check could read — reported, never counted as failures"
+        )
+
+
+def _run_verifier_interview(draft, verifier_draft_id: str, store: DerivedStore, run=None) -> None:
+    if run is not None:
+        _show_draft_run(run)
     interview = start_interview(draft, verifier_draft_id)
     while (question := next_question(interview)) is not None:
         console.print(f"\n[bold]{question.prompt}[/bold]")
@@ -400,6 +458,191 @@ def interview_verifier_command(
         raise typer.Exit(code=1) from exc
 
     _run_verifier_interview(draft, verifier_draft_id, store)
+
+
+_VERDICTS = {"s": Verdict.SUCCESS, "f": Verdict.FAILURE, "u": Verdict.UNCLEAR}
+
+
+@app.command()
+def label(
+    verifier_draft_id: str,
+    labeler: str = typer.Option(..., "--labeler", help="Who is answering."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Label the runs a family's verifiers disagree about.
+
+    Disagreements first, because that is where one label buys the most: it
+    resolves an ambiguity every verifier in the family shares.
+    """
+    store = _derived(project)
+    try:
+        draft = load_verifier_draft(verifier_draft_id, store)
+        task_set = load_task_set(draft.task_set_id, store)
+        analysis = load_analysis(draft.analysis_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    run = run_draft(draft, analysis, task_set)
+    family = task_set.family_by_id()[draft.family_id]
+    queue = [item.trace_id for item in run.disagreements]
+    queue += [t for t in family.trace_ids if t not in set(queue)]
+
+    console.print(f"family:  {family.descriptor}")
+    console.print(f"to label: {len(queue)} run(s), {len(run.disagreements)} disputed first\n")
+
+    labels = []
+    for trace_id in queue:
+        scores = run.scores_for(trace_id)
+        rendered = ", ".join(
+            f"{vid[:18]}={'unknown' if s is None else s}" for vid, s in sorted(scores.items())
+        )
+        console.print(f"[bold]{trace_id}[/bold]  verifiers: {rendered or 'not scored'}")
+        answer = typer.prompt("  succeeded? [s]uccess/[f]ailure/[u]nclear/[q]uit", default="u")
+        if answer.strip().lower().startswith("q"):
+            break
+        verdict = _VERDICTS.get(answer.strip().lower()[:1], Verdict.UNCLEAR)
+        rationale = typer.prompt("  why (optional)", default="", show_default=False)
+        labels.append(
+            make_label(
+                trace_id=trace_id,
+                family_id=family.family_id,
+                verdict=verdict,
+                labeler=labeler,
+                rationale=rationale,
+                prompted_by=verifier_draft_id
+                if trace_id in set(queue[: len(run.disagreements)])
+                else None,
+            )
+        )
+
+    label_set = LabelSet(
+        task_set_id=draft.task_set_id, family_id=family.family_id, labels=tuple(labels)
+    )
+    envelope = save_label_set(label_set, store)
+    console.print(f"\nlabel_set_id: {envelope.artifact_id}")
+    console.print(f"labels:       {len(label_set.labels)}")
+    console.print(f"adjudicated:  {len(label_set.adjudicated())}")
+
+
+@app.command(name="validate-verifier")
+def validate_verifier_command(
+    verifier_draft_id: str,
+    label_set_id: str = typer.Option(..., "--labels"),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Measure a draft against labels, then try to satisfy it without doing the task."""
+    store = _derived(project)
+    try:
+        draft = load_verifier_draft(verifier_draft_id, store)
+        task_set = load_task_set(draft.task_set_id, store)
+        analysis = load_analysis(draft.analysis_id, store)
+        label_set = load_label_set(label_set_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        validation = validate_draft(
+            draft, verifier_draft_id, task_set, analysis.evidence, label_set, label_set_id
+        )
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    envelope = save_validation(validation, store)
+    console.print(f"validation_id: {envelope.artifact_id}")
+    console.print(f"labels used:   {validation.labels_used}")
+
+    expected_by_id = {spec.verifier_id: spec.checks[0].claim for spec in draft.verifiers}
+    table = Table("verifier", "check", "split", "agree", "disagree", "unscored", "rate")
+    for item in validation.agreements:
+        if not item.labeled:
+            continue
+        table.add_row(
+            item.verifier_id[:18],
+            expected_by_id.get(item.verifier_id, "")[:30],
+            item.split,
+            str(item.agreed),
+            str(item.disagreed),
+            str(item.unscored),
+            "n/a" if item.agreement is None else f"{item.agreement:.0%}",
+        )
+    console.print(table)
+
+    # The counterexamples matter more than the rate: they show how a check would
+    # reward the wrong behaviour.
+    for item in validation.agreements:
+        for counter in item.counterexamples:
+            console.print(
+                f"[red]{counter.kind}[/red] {counter.trace_id} ({item.split}): "
+                f"verifier={counter.verifier_score} human={counter.human_verdict}"
+            )
+
+    if validation.gameability:
+        table = Table("verifier", "forged facts", "result", "hypothesis")
+        for result in validation.gameability:
+            table.add_row(
+                result.verifier_id[:18],
+                str(result.forged_facts),
+                "[red]gamed[/red]" if result.passed else "held",
+                result.hypothesis[:52],
+            )
+        console.print(table)
+
+    for limitation in validation.limitations:
+        console.print(f"[yellow]limitation:[/yellow] {limitation}")
+
+
+@app.command()
+def judge(
+    task_set_id: str,
+    family_id: str = typer.Option(..., "--family"),
+    criterion: str = typer.Option(..., "--criterion", help="What success means, in one line."),
+    rubric_id: str = typer.Option("rubric-v1", "--rubric-id"),
+    samples: int = typer.Option(5, "--samples", help="Higher separates confident from contested."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Score a family with a model judge, for tasks no deterministic check reaches."""
+    store = _derived(project)
+    task_set = _load_task_set(task_set_id, project)
+    family = task_set.family_by_id().get(family_id)
+    if family is None:
+        console.print(f"[red]error:[/red] no family {family_id!r} in {task_set_id}")
+        raise typer.Exit(code=1)
+
+    corpus = ArtifactStore(project / ".bandits").read(task_set.corpus_id)
+    traces = [t for t in corpus.traces if t.trace_id in set(family.trace_ids)]
+    rubric = Rubric(rubric_id=rubric_id, family_id=family_id, criterion=criterion, samples=samples)
+
+    try:
+        run = judge_traces(traces, rubric, task_set_id)
+    except JudgeError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    envelope = save_judge_run(run, store)
+    console.print(f"judge_run_id:  {envelope.artifact_id}")
+    console.print(f"prompt digest: {rubric.prompt_digest}")
+    console.print(f"model:         {rubric.model}")
+
+    table = Table("trace_id", "samples", "score", "agreement")
+    for verdict in run.verdicts:
+        table.add_row(
+            verdict.trace_id,
+            str(list(verdict.samples)),
+            "unknown" if verdict.score is None else f"{verdict.score:.2f}",
+            f"{verdict.agreement:.0%}",
+        )
+    console.print(table)
+
+    # A run the judge argued with itself about is worth a label, not a score.
+    contested = run.contested_trace_ids()
+    if contested:
+        console.print(
+            f"[yellow]contested:[/yellow] {', '.join(contested)} — the judge disagreed "
+            "with itself; these score unknown until a human settles them"
+        )
 
 
 if __name__ == "__main__":
