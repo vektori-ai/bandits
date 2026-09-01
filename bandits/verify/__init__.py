@@ -40,6 +40,15 @@ from bandits.verify.models import (
     VerifierSpec,
     VerifierStatus,
 )
+from bandits.verify.review import (
+    PromotionBlocker,
+    ReviewedVerifier,
+    assess_promotion,
+    compute_reviewed_verifier_id,
+    load_reviewed_verifier,
+    review_verifier,
+    save_reviewed_verifier,
+)
 from bandits.verify.run import (
     Disagreement,
     DraftRun,
@@ -63,6 +72,8 @@ from bandits.verify.validate import (
 )
 
 __all__ = [
+    "PromotionBlocker",
+    "assess_promotion",
     "Agreement",
     "Counterexample",
     "GameabilityResult",
@@ -91,6 +102,11 @@ __all__ = [
     "load_draft_run",
     "run_draft",
     "save_draft_run",
+    "ReviewedVerifier",
+    "compute_reviewed_verifier_id",
+    "load_reviewed_verifier",
+    "review_verifier",
+    "save_reviewed_verifier",
     "CheckSpec",
     "InterviewAnswer",
     "InterviewQuestion",

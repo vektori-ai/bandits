@@ -239,11 +239,7 @@ def _cluster(
     nearest: dict[str, set[str]] = {}
     for descriptor in descriptors:
         ranked = sorted(
-            (
-                (distance(descriptor, other), other)
-                for other in descriptors
-                if other != descriptor
-            ),
+            ((distance(descriptor, other), other) for other in descriptors if other != descriptor),
             key=lambda item: (item[0], item[1]),
         )
         nearest[descriptor] = {

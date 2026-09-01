@@ -14,6 +14,9 @@ measured gameability result outranks one carrying a prose warning.
 from __future__ import annotations
 
 import hashlib
+from typing import Literal
+
+from pydantic import Field, model_validator
 
 from bandits.analyze.models import Evidence, EvidenceKind, TaskSet, Visibility
 from bandits.labels import LabelSet, Verdict
@@ -53,13 +56,13 @@ class Counterexample(Contract):
 
 class Agreement(Contract):
     verifier_id: str
-    split: str
-    """``fit`` or ``held_out``. Only held_out is an honest estimate."""
+    split: Literal["fit", "held_out"]
+    """Only held_out is an honest estimate."""
 
-    labeled: int
-    agreed: int
-    disagreed: int
-    unscored: int
+    labeled: int = Field(ge=0)
+    agreed: int = Field(ge=0)
+    disagreed: int = Field(ge=0)
+    unscored: int = Field(ge=0)
     """Labeled runs the verifier could not score. Never counted as disagreement."""
 
     agreement: float | None = None
@@ -67,15 +70,70 @@ class Agreement(Contract):
 
     counterexamples: tuple[Counterexample, ...] = ()
 
+    @property
+    def scored(self) -> int:
+        return self.agreed + self.disagreed
+
+    @model_validator(mode="after")
+    def counts_agree_with_the_rate(self) -> Agreement:
+        """Recompute what the artifact claims rather than trusting the summary.
+
+        A persisted measurement is read back long after the run that produced it,
+        by code that cannot re-derive it. A stored rate that its own counts do not
+        support would be believed, and every promotion decision downstream reads
+        this number.
+        """
+        if self.labeled != self.agreed + self.disagreed + self.unscored:
+            raise ValueError(
+                f"agreement covers {self.labeled} labeled run(s) but accounts for "
+                f"{self.agreed + self.disagreed + self.unscored}"
+            )
+        expected = (self.agreed / self.scored) if self.scored else None
+        if expected is None and self.agreement is not None:
+            raise ValueError("agreement rate is stated for a split with nothing scorable")
+        if expected is not None and (
+            self.agreement is None or abs(self.agreement - expected) > 1e-9
+        ):
+            raise ValueError(f"stated agreement {self.agreement} does not match {expected}")
+        if len(self.counterexamples) > self.disagreed:
+            raise ValueError("more counterexamples than disagreements")
+        if any(
+            item.kind not in {"false_positive", "false_negative"} for item in self.counterexamples
+        ):
+            raise ValueError("a counterexample must be a false positive or a false negative")
+        return self
+
 
 class GameabilityResult(Contract):
-    """Whether a constructed run satisfying the check actually passed it."""
+    """Whether a constructed run satisfying a check actually passed the verifier."""
 
     verifier_id: str
     hypothesis: str
     constructed: dict[str, object]
     passed: bool
-    """True means the attack worked: the check accepted a run that did not do the task."""
+    """True means the attack worked: the verifier accepted a run that did not do the task."""
+
+    scope: Literal["check", "composite"] = "check"
+    """``check`` forges one check's evidence; ``composite`` forges every check's.
+
+    Both are scored against the whole verifier, never against the check alone.
+    Scoring a lone check answers a question nobody asked: a composite verifier
+    fails closed when any other check loses its evidence, so an isolated forgery
+    that "passes" one check leaves the real verifier returning unknown. Measuring
+    it that way reported every composite verifier as gameable when none were.
+    """
+
+    checks_attacked: int = 1
+    checks_total: int = 1
+
+    @property
+    def complete(self) -> bool:
+        """Whether every check could be attacked at all.
+
+        An incomplete attack that failed proves nothing: the checks no template
+        knows how to forge were never tried.
+        """
+        return self.checks_attacked == self.checks_total
 
     forged_facts: int
     """How many facts had to be fabricated for the attack to land.
@@ -93,12 +151,31 @@ class Validation(Contract):
     source_draft_id: str
     family_id: str
     label_set_id: str
-    success_threshold: float = DEFAULT_SUCCESS_THRESHOLD
+    success_threshold: float = Field(default=DEFAULT_SUCCESS_THRESHOLD, ge=0, le=1)
     agreements: tuple[Agreement, ...] = ()
     gameability: tuple[GameabilityResult, ...] = ()
-    labels_used: int = 0
-    unclear_labels: int = 0
+    labels_used: int = Field(default=0, ge=0)
+    unclear_labels: int = Field(default=0, ge=0)
+
+    success_labels: int = Field(default=0, ge=0)
+    failure_labels: int = Field(default=0, ge=0)
+    """How the family's labels split. A check measured against one verdict only
+    has agreed with nothing it could have disagreed with."""
+
     limitations: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def measurements_are_coherent(self) -> Validation:
+        seen = [(item.verifier_id, item.split) for item in self.agreements]
+        if len(seen) != len(set(seen)):
+            raise ValueError("validation states two agreements for one verifier and split")
+        measured = {item.verifier_id for item in self.agreements}
+        stray = {item.verifier_id for item in self.gameability} - measured
+        if stray:
+            raise ValueError(f"gameability reported for unmeasured verifier(s): {sorted(stray)}")
+        if self.success_labels + self.failure_labels > self.labels_used:
+            raise ValueError("more adjudicated verdicts than labels used")
+        return self
 
     def held_out(self, verifier_id: str) -> Agreement | None:
         return next(
@@ -255,22 +332,61 @@ def _attack(check: CheckSpec) -> tuple[str, tuple[Evidence, ...], dict[str, obje
     return None
 
 
-def probe_gameability(spec: VerifierSpec) -> list[GameabilityResult]:
-    """Construct a run that satisfies each check without doing the task, and score it."""
+def probe_gameability(
+    spec: VerifierSpec, *, success_threshold: float = DEFAULT_SUCCESS_THRESHOLD
+) -> list[GameabilityResult]:
+    """Construct runs that satisfy the checks without doing the task, and score them.
+
+    Every attack is scored against the complete verifier. One forged field
+    defeating a single-check verifier and one forged field defeating a
+    twelve-check verifier are different findings, and only the whole spec can
+    tell them apart.
+    """
+    attacks = [(check, _attack(check)) for check in spec.checks]
+    available = [(check, attack) for check, attack in attacks if attack is not None]
     results: list[GameabilityResult] = []
-    for check in spec.checks:
-        attack = _attack(check)
-        if attack is None:
-            continue
+
+    def score(evidence: tuple[Evidence, ...]) -> float | None:
+        return execute_verifier(spec, evidence).score
+
+    for _, attack in available:
         hypothesis, evidence, constructed = attack
-        score = execute_verifier(spec.replace(checks=(check,)), evidence).score
+        result = score(evidence)
         results.append(
             GameabilityResult(
                 verifier_id=spec.verifier_id,
                 hypothesis=hypothesis,
                 constructed=constructed,
-                passed=score is not None and score >= DEFAULT_SUCCESS_THRESHOLD,
+                passed=result is not None and result >= success_threshold,
+                scope="check",
+                checks_attacked=1,
+                checks_total=len(spec.checks),
                 forged_facts=len(evidence),
+            )
+        )
+
+    if len(spec.checks) > 1 and available:
+        # Forging one field at a time leaves the rest unknown and the verifier
+        # unscorable. Forging all of them at once is the attack that actually
+        # threatens a composite check, and its cost is the count of facts it took.
+        merged: dict[str, Evidence] = {}
+        constructed: dict[str, object] = {}
+        for _, attack in available:
+            _, evidence, fields = attack
+            for item in evidence:
+                merged.setdefault(item.evidence_id, item)
+            constructed.update(fields)
+        result = score(tuple(merged.values()))
+        results.append(
+            GameabilityResult(
+                verifier_id=spec.verifier_id,
+                hypothesis="Satisfy every check at once without performing the task.",
+                constructed=constructed,
+                passed=result is not None and result >= success_threshold,
+                scope="composite",
+                checks_attacked=len(available),
+                checks_total=len(spec.checks),
+                forged_facts=len(merged),
             )
         )
     return results
@@ -314,7 +430,7 @@ def validate_draft(
                     threshold=success_threshold,
                 )
             )
-        gameability.extend(probe_gameability(spec))
+        gameability.extend(probe_gameability(spec, success_threshold=success_threshold))
 
     limitations: list[str] = []
     if not any(a.split == "held_out" and a.labeled for a in agreements):
@@ -329,6 +445,12 @@ def validate_draft(
             "every rate above rather than counted as either outcome"
         )
 
+    # Counted over this family only: a corpus-wide verdict tally would let
+    # labels from another task stand in for the ones this check was measured on.
+    family_traces = set(family.fit_trace_ids) | set(family.held_out_trace_ids)
+    in_family = [verdicts[trace_id] for trace_id in family_traces if trace_id in verdicts]
+    successes = sum(1 for verdict in in_family if verdict is Verdict.SUCCESS)
+
     return Validation(
         source_draft_id=draft_id,
         family_id=draft.family_id,
@@ -338,6 +460,8 @@ def validate_draft(
         gameability=tuple(gameability),
         labels_used=len(verdicts),
         unclear_labels=unclear,
+        success_labels=successes,
+        failure_labels=len(in_family) - successes,
         limitations=tuple(limitations),
     )
 
@@ -347,11 +471,17 @@ def calibrate(spec: VerifierSpec, validation_id: str) -> VerifierSpec:
     return spec.replace(status=VerifierStatus.CALIBRATED, validation_artifact_id=validation_id)
 
 
-def accept(spec: VerifierSpec, acceptance_id: str) -> VerifierSpec:
-    """Record a human owner accepting a calibrated verifier."""
+def accept(spec: VerifierSpec, acceptance_id: str, *, over_risk: bool = False) -> VerifierSpec:
+    """Record a human owner accepting a calibrated verifier.
+
+    ``over_risk`` marks an acceptance made against the evidence rather than with
+    it, and lands on a different status so nothing downstream has to reconstruct
+    which of the two happened.
+    """
     if spec.status is not VerifierStatus.CALIBRATED:
         raise ValueError("only a calibrated verifier can be accepted")
-    return spec.replace(status=VerifierStatus.REVIEWED, human_acceptance_id=acceptance_id)
+    status = VerifierStatus.RISK_ACCEPTED if over_risk else VerifierStatus.REVIEWED
+    return spec.replace(status=status, human_acceptance_id=acceptance_id)
 
 
 def compute_validation_id(validation: Validation) -> str:

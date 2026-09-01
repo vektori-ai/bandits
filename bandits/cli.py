@@ -22,6 +22,13 @@ from bandits.analyze import (
     save_task_set,
     split_family,
 )
+from bandits.export import (
+    Partition,
+    build_eval_export,
+    build_sft_export,
+    save_export,
+    write_jsonl,
+)
 from bandits.ingest import CANONICAL_SOURCES, UnknownSourceError, load_corpus
 from bandits.labels import (
     LabelSet,
@@ -35,11 +42,14 @@ from bandits.store import ArtifactStore, DerivedStore
 from bandits.verify import (
     answer_question,
     draft_verifiers,
+    load_reviewed_verifier,
     load_verifier_draft,
     next_question,
+    review_verifier,
     run_draft,
     save_draft_run,
     save_interview,
+    save_reviewed_verifier,
     save_verifier_draft,
     start_interview,
 )
@@ -50,6 +60,7 @@ from bandits.verify.judge import (
     save_judge_run,
 )
 from bandits.verify.validate import (
+    load_validation,
     save_validation,
     validate_draft,
 )
@@ -592,6 +603,111 @@ def validate_verifier_command(
 
     for limitation in validation.limitations:
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
+
+
+@app.command(name="review-verifier")
+def review_verifier_command(
+    verifier_draft_id: str,
+    validation_id: str = typer.Option(..., "--validation"),
+    verifier_id: str = typer.Option(..., "--verifier"),
+    acceptance_id: str = typer.Option(
+        ..., "--acceptance-id", help="Ticket, review record, or owner decision id."
+    ),
+    accept_risks: bool = typer.Option(
+        False,
+        "--accept-risks",
+        help="Promote despite blockers, recording them on the artifact.",
+    ),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Record explicit human acceptance of one calibrated verifier."""
+    store = _derived(project)
+    try:
+        draft = load_verifier_draft(verifier_draft_id, store)
+        validation = load_validation(validation_id, store)
+        reviewed = review_verifier(
+            draft,
+            verifier_draft_id,
+            validation,
+            validation_id,
+            verifier_id,
+            acceptance_id,
+            accept_risks=accept_risks,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    envelope = save_reviewed_verifier(reviewed, store)
+    console.print(f"reviewed_verifier_id: {envelope.artifact_id}")
+    console.print(f"verifier:             {reviewed.spec.verifier_id}")
+    console.print(f"status:               {reviewed.spec.status.value}")
+    console.print(f"validation:           {reviewed.validation_id}")
+    console.print(f"acceptance:           {reviewed.human_acceptance_id}")
+    console.print(f"threshold:            {reviewed.success_threshold}")
+    for risk in reviewed.accepted_risks:
+        console.print(f"[yellow]accepted risk:[/yellow] {risk.code} — {risk.detail}")
+
+
+@app.command(name="export")
+def export_command(
+    task_set_id: str,
+    format_: str = typer.Option(..., "--format", help="One of: eval, sft"),
+    reviewed_verifier_id: str = typer.Option(..., "--verifier"),
+    output: Path = typer.Option(..., "--output"),
+    split: str = typer.Option(
+        None,
+        "--split",
+        help="fit, held_out or all. Defaults to fit for sft and held_out for eval.",
+    ),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Write reviewed eval or SFT rows plus an unresolved quarantine file."""
+    if format_ not in {"eval", "sft"}:
+        console.print("[red]error:[/red] --format must be one of: eval, sft")
+        raise typer.Exit(code=1)
+    default_split = Partition.FIT if format_ == "sft" else Partition.HELD_OUT
+    try:
+        partition = Partition(split) if split else default_split
+    except ValueError:
+        console.print("[red]error:[/red] --split must be one of: fit, held_out, all")
+        raise typer.Exit(code=1) from None
+    store = _derived(project)
+    try:
+        task_set = load_task_set(task_set_id, store)
+        analysis = load_analysis(task_set.analysis_id, store)
+        corpus = ArtifactStore(project / ".bandits").read(task_set.corpus_id)
+        reviewed = load_reviewed_verifier(reviewed_verifier_id, store)
+        builder = build_eval_export if format_ == "eval" else build_sft_export
+        bundle = builder(
+            corpus,
+            task_set,
+            task_set_id,
+            analysis,
+            reviewed,
+            reviewed_verifier_id,
+            partition=partition,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    envelope = save_export(bundle, store)
+    accepted_path, unresolved_path = write_jsonl(bundle, output)
+    console.print(f"export_id:   {envelope.artifact_id}")
+    console.print(f"format:      {format_}")
+    console.print(
+        f"split:       {partition.value} ({bundle.manifest.partition_trace_count} trace(s))"
+    )
+    console.print(f"threshold:   {bundle.manifest.success_threshold}")
+    console.print(f"authorized:  {bundle.manifest.verifier_status}")
+    console.print(f"rows:        {len(bundle.rows)}")
+    console.print(f"unresolved:  {len(bundle.unresolved)}")
+    console.print(f"output:      {accepted_path}")
+    console.print(f"quarantine:  {unresolved_path}")
+    for code in bundle.manifest.accepted_risks:
+        console.print(f"[yellow]accepted risk:[/yellow] {code}")
+    for warning in bundle.manifest.warnings:
+        console.print(f"[yellow]warning:[/yellow] {warning}")
 
 
 @app.command()

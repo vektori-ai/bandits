@@ -24,7 +24,25 @@ class VerifierStatus(str, Enum):
     EXECUTABLE = "executable"
     CALIBRATED = "calibrated"
     REVIEWED = "reviewed"
+
+    RISK_ACCEPTED = "risk_accepted"
+    """An owner promoted this over evidence that said not to.
+
+    Separate from ``reviewed`` because the two are not the same artifact. A
+    verifier accepted despite a working attack, or with nothing held out to
+    measure it on, must not be indistinguishable downstream from one that
+    cleared every check — the override is exactly what a later reader needs to
+    see, and a shared status would hide it.
+    """
+
     REJECTED = "rejected"
+
+
+_ACCEPTED_STATUSES = frozenset({VerifierStatus.REVIEWED, VerifierStatus.RISK_ACCEPTED})
+"""Statuses that only a named human decision can reach."""
+
+_MEASURED_STATUSES = frozenset({VerifierStatus.CALIBRATED}) | _ACCEPTED_STATUSES
+"""Statuses that require a validation artifact behind them."""
 
 
 class CheckOperator(str, Enum):
@@ -98,10 +116,7 @@ class VerifierSpec(Contract):
     def validate_lifecycle(self) -> VerifierSpec:
         if not self.checks:
             raise ValueError("a verifier must contain at least one check")
-        if self.rests_only_on_self_report and self.status in {
-            VerifierStatus.CALIBRATED,
-            VerifierStatus.REVIEWED,
-        }:
+        if self.rests_only_on_self_report and self.status in _MEASURED_STATUSES:
             # The agent asserting it finished is never sufficient on its own. A
             # check reading only that may be drafted and run, so its disagreement
             # with better evidence stays visible, but it can never be promoted.
@@ -110,11 +125,10 @@ class VerifierSpec(Contract):
             )
         if self.mode is VerifierMode.REPLAY and any(i.startswith("live:") for i in self.inputs):
             raise ValueError("a replay verifier cannot declare a live input")
-        if self.status in {VerifierStatus.CALIBRATED, VerifierStatus.REVIEWED}:
-            if not self.validation_artifact_id:
-                raise ValueError(f"{self.status.value} requires a validation artifact")
-        if self.status is VerifierStatus.REVIEWED and not self.human_acceptance_id:
-            raise ValueError("reviewed requires explicit human acceptance")
+        if self.status in _MEASURED_STATUSES and not self.validation_artifact_id:
+            raise ValueError(f"{self.status.value} requires a validation artifact")
+        if self.status in _ACCEPTED_STATUSES and not self.human_acceptance_id:
+            raise ValueError(f"{self.status.value} requires explicit human acceptance")
         return self
 
 

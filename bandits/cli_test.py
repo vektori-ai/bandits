@@ -4,11 +4,12 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from bandits.analyze import load_task_set
+from bandits.analyze import load_analysis, load_task_set
 from bandits.cli import app
 from bandits.ingest.otlp import load_otlp
 from bandits.store import DerivedStore, compute_artifact_id
-from bandits.verify import load_interview, load_verifier_draft
+from bandits.verify import draft_verifiers, load_interview, load_verifier_draft, save_verifier_draft
+from bandits.verify.validate import Agreement, Validation, save_validation
 
 runner = CliRunner()
 FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "traces.otlp.jsonl"
@@ -393,3 +394,129 @@ def test_validate_verifier_needs_an_existing_label_set(tmp_path) -> None:
     )
 
     assert result.exit_code == 1
+
+
+def _reviewed_refund_verifier(tmp_path: Path) -> tuple[str, str]:
+    """Build through validation, then exercise explicit acceptance through the CLI."""
+    task_set_id = _mined(tmp_path)
+    store = DerivedStore(tmp_path / ".bandits")
+    task_set = load_task_set(task_set_id, store)
+    analysis = load_analysis(task_set.analysis_id, store)
+    family = next(item for item in task_set.families if "refund" in item.descriptor)
+    draft = draft_verifiers(task_set, task_set_id, analysis, family.family_id, limit=8)
+    spec = next(
+        item
+        for item in draft.verifiers
+        if item.checks[0].claim == "final_state_field:status"
+        and item.checks[0].expected == "refunded"
+    )
+    draft_id = save_verifier_draft(draft, store).artifact_id
+    validation = Validation(
+        source_draft_id=draft_id,
+        family_id=family.family_id,
+        label_set_id="labels-cli",
+        agreements=(
+            Agreement(
+                verifier_id=spec.verifier_id,
+                split="held_out",
+                labeled=1,
+                agreed=1,
+                disagreed=0,
+                unscored=0,
+                agreement=1,
+            ),
+        ),
+        labels_used=2,
+        success_labels=1,
+        failure_labels=1,
+    )
+    validation_id = save_validation(validation, store).artifact_id
+    result = runner.invoke(
+        app,
+        [
+            "review-verifier",
+            draft_id,
+            "--validation",
+            validation_id,
+            "--verifier",
+            spec.verifier_id,
+            "--acceptance-id",
+            "owner-ticket-cli",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    reviewed_id = result.stdout.split("reviewed_verifier_id:")[1].split()[0]
+    return task_set_id, reviewed_id
+
+
+def test_eval_and_sft_export_end_to_end_write_quarantine(tmp_path) -> None:
+    task_set_id, reviewed_id = _reviewed_refund_verifier(tmp_path)
+
+    eval_output = tmp_path / "out" / "eval.jsonl"
+    evaluated = runner.invoke(
+        app,
+        [
+            "export",
+            task_set_id,
+            "--format",
+            "eval",
+            "--verifier",
+            reviewed_id,
+            "--output",
+            str(eval_output),
+            "--project",
+            str(tmp_path),
+        ],
+    )
+    assert evaluated.exit_code == 0, evaluated.stdout
+    assert eval_output.exists()
+    assert eval_output.with_name("eval.unresolved.jsonl").exists()
+    assert '"grader"' in eval_output.read_text()
+
+    sft_output = tmp_path / "out" / "sft.jsonl"
+    trained = runner.invoke(
+        app,
+        [
+            "export",
+            task_set_id,
+            "--format",
+            "sft",
+            "--verifier",
+            reviewed_id,
+            "--output",
+            str(sft_output),
+            "--project",
+            str(tmp_path),
+        ],
+    )
+    assert trained.exit_code == 0, trained.stdout
+    assert "rows:" in trained.stdout and "unresolved:" in trained.stdout
+    assert sft_output.exists()
+    quarantine = sft_output.with_name("sft.unresolved.jsonl")
+    assert quarantine.exists()
+    assert '"messages"' in sft_output.read_text()
+    assert '"reasons"' in quarantine.read_text()
+
+
+def test_export_rejects_unknown_format_before_writing(tmp_path) -> None:
+    output = tmp_path / "bad.jsonl"
+    result = runner.invoke(
+        app,
+        [
+            "export",
+            "taskset-nope",
+            "--format",
+            "preference",
+            "--verifier",
+            "reviewed-nope",
+            "--output",
+            str(output),
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert not output.exists()
