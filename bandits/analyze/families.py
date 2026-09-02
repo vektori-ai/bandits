@@ -48,19 +48,15 @@ _TAIL_SLOTS: tuple[SlotKind, ...] = (
     SlotKind.UNMEASURABLE,
 )
 
-# Slots the deterministic core cannot fill. Named rather than omitted, because a
-# selection missing its escalation cases should say so instead of looking whole.
-_DOMAIN_SLOTS: tuple[tuple[str, str], ...] = (
-    (
-        "escalation",
-        "recognizing a handoff or escalation needs a domain extension; "
-        "no domain-independent signal exists in the trace",
-    ),
-    (
-        "policy_boundary",
-        "recognizing a policy boundary case needs a domain extension; "
-        "the core cannot tell a refused request from a failed one",
-    ),
+# The reserve is filled from structural signals alone: an error status, a rare
+# tool, an unusual length, absent terminal evidence. Categories that need to know
+# what the work *meant* — a handoff, a refused request, a partial success — are
+# invisible here, and no fixed list of them holds across domains. The selection
+# says so as a limitation rather than naming categories from one domain and
+# reporting them missing everywhere else.
+_SEMANTIC_RESERVE_LIMIT = (
+    "the tail reserve is filled from structural signals only; categories that "
+    "depend on what the work meant need a domain extension to select for"
 )
 
 _MASKS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -495,9 +491,6 @@ def mine_task_set(
             )
         )
 
-    for slot_name, reason in _DOMAIN_SLOTS:
-        missing.append(MissingSlot(slot=slot_name, reason=reason))
-
     # Whatever budget is left goes to whatever is least like what is already in.
     remaining_pool = [f for f in features if f.trace_id not in taken]
     for feature in _farthest_first(remaining_pool, chosen, budget - len(selected), distance):
@@ -513,7 +506,7 @@ def mine_task_set(
     represented = {s.family_id for s in selected}
     covered_mass = sum(f.workload_mass for f in families if f.family_id in represented)
 
-    limitations: list[str] = list(analysis.limitations)
+    limitations: list[str] = [*analysis.limitations, _SEMANTIC_RESERVE_LIMIT]
     if ungroupable:
         limitations.append(
             f"{len(ungroupable)} trace(s) declare no instruction and cannot be grouped; "

@@ -176,9 +176,18 @@ def test_unfillable_slots_are_named_with_a_reason(task_set: TaskSet) -> None:
     # already taken as its family's medoid.
     assert "already selected" in reasons["long_episode"]
     assert "already selected" in reasons["rare_tool"]
-    # These need a domain extension and are reported every time, not omitted.
-    assert "domain extension" in reasons["escalation"]
-    assert "domain extension" in reasons["policy_boundary"]
+
+
+def test_missing_slots_name_no_domain_specific_category(task_set: TaskSet) -> None:
+    """Every reserved slot is structural, so the same set is reachable in any domain."""
+    assert {slot.slot for slot in task_set.missing_slots} <= {s.value for s in SlotKind}
+
+
+def test_semantic_categories_are_declared_a_limitation_not_a_missing_slot(
+    task_set: TaskSet,
+) -> None:
+    """The core says it cannot select for meaning, without guessing at what meaning."""
+    assert any("domain extension to select for" in limit for limit in task_set.limitations)
 
 
 def test_coverage_reports_what_a_small_budget_leaves_out(analysis) -> None:

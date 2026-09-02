@@ -705,7 +705,6 @@ The existing code is the ingestion foundation, not disposable prototype work:
 | `bandits/ingest/` | Yes | Declare importer capabilities and retain tool results, errors, and outcome signals |
 | `bandits/store.py` | Yes | Store derived analysis artifacts beside immutable corpora |
 | `bandits/cli.py` | Yes | Add `analyze`, then verifier and export commands incrementally |
-| `scripts/convert_cursor_session.py` | Temporary | Use it to discover Cursor fields before deciding on a supported adapter |
 
 Do not put inferred outcomes or verifier decisions directly on `Trace`. The same
 trace may be reassessed with a newer policy or corrected by a reviewer without
