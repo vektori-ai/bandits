@@ -123,9 +123,10 @@ _SECRET_RULES: tuple[Rule, ...] = (
 
 DEFAULT_RULESET = RedactionRuleset("default-v1", _SECRET_RULES + (_EMAIL,))
 
-# An email is often the task's own identifier ("refund the order for a@b.com").
-# Removing it can make an otherwise usable task candidate meaningless, so callers
-# who need the instruction intact can drop that one rule and still redact secrets.
+# An email is sometimes the task's own identifier rather than incidental personal
+# data — the instruction names an account, and redacting it leaves an instruction
+# that identifies nothing. Callers who need those instructions intact can drop
+# that one rule and still redact every secret.
 SECRETS_ONLY_RULESET = RedactionRuleset("secrets-only-v1", _SECRET_RULES)
 
 _RULESETS = {r.name: r for r in (DEFAULT_RULESET, SECRETS_ONLY_RULESET)}

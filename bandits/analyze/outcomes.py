@@ -1,9 +1,10 @@
 """Read outcome evidence off a trace, without deciding the outcome.
 
 Every detector here answers "what did the source actually record?", never "did
-this run succeed?". A tool whose result contains the word ``refunded`` is
-evidence about a field, not a verdict; collapsing the two is the mistake that
-makes a corpus look better than it was.
+this run succeed?". A tool result carrying a terminal-looking status is evidence
+about a field, not a verdict; collapsing the two is the mistake that makes a
+corpus look better than it was. Which fields mean success is a question for a
+verifier, drafted and then argued with — not for a reader of spans.
 """
 
 from __future__ import annotations

@@ -129,8 +129,9 @@ def _invariants(
     """Propose ``final.X == initial.Y`` wherever it held on every fit trace.
 
     A field equalling a fixed value says a step happened. A field equalling the
-    initial state it derives from says the step was *correct* — that the refund
-    matched what was charged, not merely that a refund occurred.
+    initial state it derives from says the step was *correct*, and it keeps
+    saying so when the value differs run to run — which a fixed value cannot do,
+    because it was only ever the one value this corpus happened to record.
     """
     by_trace: dict[str, dict[tuple[str, str], Any]] = {}
     for item in evidence:

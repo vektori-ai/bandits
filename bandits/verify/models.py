@@ -55,8 +55,10 @@ class CheckOperator(str, Enum):
     STATE_INVARIANT = "state_invariant"
     """A terminal field agrees with the initial state it is derived from.
 
-    The check a single field cannot express: that a refund matched what was
-    charged, rather than merely that a refund happened.
+    The check a single field cannot express. A fixed value says a step
+    happened; a value that still agrees with what it came from says the step
+    was *correct* — that the amount returned matched the amount taken, that the
+    row count after a migration matched the row count before it.
     """
 
     NO_SPAN_ERROR = "no_span_error"

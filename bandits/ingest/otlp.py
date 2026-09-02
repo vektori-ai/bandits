@@ -15,7 +15,7 @@ Expected record shape, one JSON object per line::
       "end_time": "2026-01-01T00:00:01Z",
       "attributes": {
         "gen_ai.operation.name": "chat",
-        "task": "Refund order 7741"
+        "task": "Fix the failing test in parser.py"
       }
     }
 

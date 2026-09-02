@@ -55,8 +55,9 @@ def _keyed_equality(check: CheckSpec, evidence: tuple[Evidence, ...], claim: str
 def _state_invariant(check: CheckSpec, evidence: tuple[Evidence, ...]) -> _Outcome:
     """Compare a terminal field against the initial state it should agree with.
 
-    This is the check a single terminal field cannot express: that a refund
-    matched what was charged, rather than merely that a refund happened.
+    Unknown, not failed, when either side went unrecorded: a relation between
+    two fields needs both of them, and a trace that captured neither says
+    nothing about whether the relation held.
     """
     final_key, _, initial_key = check.claim.partition(":")[2].partition("==")
     final = _field(evidence, "final_state_field", final_key)
