@@ -8,6 +8,7 @@ reason the backend exists.
 
 from __future__ import annotations
 
+import json
 import os
 from unittest import mock
 
@@ -209,3 +210,31 @@ def test_a_success_response_with_an_error_body_is_still_a_failure() -> None:
         pytest.raises(EmbeddingError, match="not usable"),
     ):
         build_cache(["alpha"], model="stub")
+
+
+def test_an_unusable_response_is_described_without_quoting_its_contents() -> None:
+    """A body can carry partial vectors; an error that pastes them is unreadable."""
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {"error": "quota exceeded", "data": None, "junk": [0.123] * 5000}
+            ).encode()
+
+    with (
+        mock.patch("urllib.request.urlopen", return_value=_Response()),
+        mock.patch.dict(os.environ, {"FIREWORKS_API_KEY": "x"}),
+        pytest.raises(EmbeddingError) as raised,
+    ):
+        build_cache(["alpha"], model="stub")
+
+    message = str(raised.value)
+    assert "quota exceeded" in message, "the stated reason has to survive"
+    assert "0.123" not in message, "the payload's contents must not"
+    assert len(message) < 300

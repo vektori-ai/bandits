@@ -79,10 +79,24 @@ def fireworks_embedder(model: str, texts: Sequence[str]) -> list[list[float]]:
     except (KeyError, TypeError) as exc:
         # A 200 carrying an error body — a quota message, a changed schema —
         # is still a failure, and must surface as one rather than a traceback.
-        raise EmbeddingError(f"embedding response was not usable: {payload}") from exc
+        # Only the shape and any stated reason: the body may carry partial
+        # vectors, and pasting those into an error makes it unreadable.
+        raise EmbeddingError(f"embedding response was not usable: {_describe(payload)}") from exc
     if len(ordered) != len(texts):
         raise EmbeddingError(f"asked for {len(texts)} vectors, received {len(ordered)}")
     return [item["embedding"] for item in ordered]
+
+
+def _describe(payload: object) -> str:
+    """What came back, without its contents. Vectors are large and never help here."""
+    if not isinstance(payload, dict):
+        return f"{type(payload).__name__}, expected an object with a 'data' list"
+    stated = next(
+        (str(payload[key])[:200] for key in ("error", "message", "detail") if key in payload),
+        None,
+    )
+    shape = f"keys {sorted(payload)}"
+    return f"{shape}; {stated}" if stated else shape
 
 
 def build_cache(

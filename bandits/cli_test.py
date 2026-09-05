@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from unittest import mock
@@ -115,13 +116,26 @@ def offline_embedder(monkeypatch):
     """
 
     def deterministic(model: str, texts):
-        vocabulary = sorted({token for text in texts for token in text.split()})
-        return [
-            [1.0 if token in set(text.split()) else 0.0 for token in vocabulary] or [1.0]
-            for text in texts
-        ]
+        # Hashed into a fixed width rather than a per-call vocabulary: build_cache
+        # embeds in batches, so a vocabulary derived from the batch would give
+        # later batches a different dimensionality and make cosine_distance raise.
+        # Wide enough that the fixtures' tokens do not collide, which would merge
+        # descriptors that share no words.
+        width = 4096
+        vectors = []
+        for text in texts:
+            vector = [0.0] * width
+            for token in text.split():
+                vector[hash_token(token) % width] = 1.0
+            vectors.append(vector)
+        return vectors
 
     monkeypatch.setattr("bandits.cli.build_cache", _partial_embed(deterministic))
+
+
+def hash_token(token: str) -> int:
+    """Stable across processes, unlike hash(), so vectors do not shift per run."""
+    return int(hashlib.sha256(token.encode()).hexdigest()[:8], 16)
 
 
 def _partial_embed(embedder):

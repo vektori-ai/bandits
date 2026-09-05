@@ -31,7 +31,6 @@ from bandits.analyze.embed import (
     EmbeddingCache,
     EmbeddingError,
     build_cache,
-    compute_cache_id,
     descriptors,
     embedding_distance,
     load_cache,
@@ -240,17 +239,18 @@ def _embedding_cache(analysis, store: DerivedStore, model: str) -> tuple[Embeddi
     """
     wanted = descriptors(analysis)
     existing: EmbeddingCache | None = None
+    reused_id = ""
     for envelope in store.list(kind="embeddings"):
         if envelope.parent_artifact_id != analysis.corpus_id:
             continue
         candidate = load_cache(envelope.artifact_id, store)
         if candidate.model == model:
-            existing = candidate
+            existing, reused_id = candidate, envelope.artifact_id
             break
 
     cache = build_cache(wanted, model=model, existing=existing)
     if existing is not None and cache.vectors == existing.vectors:
-        return cache, compute_cache_id(cache)
+        return cache, reused_id
     return cache, save_cache(cache, store, analysis.corpus_id).artifact_id
 
 
