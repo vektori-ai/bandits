@@ -256,6 +256,17 @@ class TaskFamily(Contract):
     held_out_trace_ids: tuple[str, ...] = ()
     proposed_by: Literal["rule", "model", "human"] = "rule"
     review_status: Literal["proposed", "accepted", "split", "merged"] = "proposed"
+
+    diameter: float = 0.0
+    """Widest distance between any two descriptors in this family, in [0, 1].
+
+    Grouping links edges, not spans, so this is the one number that says how far
+    apart a family's most distant members actually are. Recorded on every family
+    so the threshold that flags it can be re-chosen later without re-mining."""
+
+    over_merged: bool = False
+    """The span exceeds what any single admitted link explains; see ``limitations``."""
+
     limitations: tuple[str, ...] = ()
 
 

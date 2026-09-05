@@ -252,6 +252,16 @@ def _report(task_set, envelope_id: str) -> None:
 
     for slot in task_set.missing_slots:
         console.print(f"[yellow]missing slot[/yellow] {slot.slot}: {slot.reason}")
+
+    # An over-merged family is invisible in the table above: it reads as one
+    # large healthy group. Verifiers are drafted per family, so it has to be
+    # said here rather than only under `families --family`.
+    for family in task_set.families:
+        if not family.over_merged:
+            continue
+        for limitation in family.limitations:
+            console.print(f"[yellow]over-merged[/yellow] {family.family_id}: {limitation}")
+
     for limitation in task_set.limitations:
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
 

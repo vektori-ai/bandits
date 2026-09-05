@@ -26,7 +26,7 @@ from bandits.analyze import (
     split_family,
 )
 from bandits.analyze.families import _cluster, _medoid, _TraceFeatures, jaccard_distance
-from bandits.analyze.models import TaskFamily, TaskSet
+from bandits.analyze.models import CorpusAnalysis, TaskCandidate, TaskFamily, TaskSet
 from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
 
@@ -320,3 +320,66 @@ def test_task_set_round_trips_through_the_derived_store(tmp_path, task_set: Task
     assert envelope.kind == "taskset"
     assert envelope.parent_artifact_id == task_set.analysis_id
     assert load_task_set(envelope.artifact_id, store) == task_set
+
+
+_CHAIN = ("descriptor alpha", "descriptor bravo", "descriptor charlie", "descriptor delta")
+"""Four descriptors placed on a line by _chain_distance, 0.25 apart in order."""
+
+
+def _chain_analysis(count: int) -> CorpusAnalysis:
+    return CorpusAnalysis(
+        corpus_id="corpus-chain",
+        source="otlp",
+        evidence=(),
+        tasks=tuple(
+            TaskCandidate(task_id=f"task-{i}", trace_id=f"c{i}", instruction=text)
+            for i, text in enumerate(_CHAIN[:count])
+        ),
+    )
+
+
+def _chain_distance(left: str, right: str) -> float:
+    """Distance along a line: adjacent descriptors 0.25 apart, the ends 0.75."""
+    position = {normalize_instruction(text): i * 0.25 for i, text in enumerate(_CHAIN)}
+    return abs(position[left] - position[right])
+
+
+def test_a_transitively_chained_family_is_reported_as_over_merged() -> None:
+    """Every edge legal at 0.25, the component 0.75 wide: the span no link explains."""
+    task_set = mine_task_set(
+        _chain_analysis(4), "analysis-x", budget=10, similarity=0.7, distance=_chain_distance
+    )
+
+    family = next(f for f in task_set.families if f.workload_mass == 4)
+    assert family.over_merged
+    assert family.diameter == pytest.approx(0.75)
+
+
+def test_the_flag_names_the_pair_that_spans_the_family() -> None:
+    task_set = mine_task_set(
+        _chain_analysis(4), "analysis-x", budget=10, similarity=0.7, distance=_chain_distance
+    )
+
+    limitation = next(
+        limit for f in task_set.families for limit in f.limitations if "widest pair" in limit
+    )
+    assert "descriptor alpha" in limitation
+    assert "descriptor delta" in limitation
+
+
+def test_a_family_no_wider_than_one_legal_link_is_not_flagged() -> None:
+    task_set = mine_task_set(
+        _chain_analysis(2), "analysis-x", budget=10, similarity=0.7, distance=_chain_distance
+    )
+
+    family = next(f for f in task_set.families if f.workload_mass == 2)
+    assert not family.over_merged
+    assert family.diameter == pytest.approx(0.25)
+
+
+def test_flagging_changes_no_grouping(task_set: TaskSet, analysis) -> None:
+    """Advisory only: a different factor must move no trace between families."""
+    loose = mine_task_set(analysis, compute_analysis_id(analysis), budget=10, diameter_factor=99.0)
+
+    assert [f.trace_ids for f in loose.families] == [f.trace_ids for f in task_set.families]
+    assert not any(f.over_merged for f in loose.families)

@@ -39,6 +39,26 @@ DEFAULT_SIMILARITY = 0.7
 DEFAULT_NEIGHBORS = 3
 """Maximum neighbors per descriptor in the mutual-kNN grouping graph."""
 
+DEFAULT_DIAMETER_FACTOR = 1.25
+"""Multiple of the link threshold above which a family is reported as over-merged.
+
+Mutual-kNN bounds each *edge* but not the *span* of the component it builds, so a
+family can end up wider than the threshold that admitted any of its links without
+a single edge having broken the rule. A span at or under the threshold is always
+explicable as one legal edge; past it, the family is only held together
+transitively, and the further past, the less any single pair accounts for it.
+
+Measured on thirteen support instructions embedded with qwen3-embedding-8b: the
+families that collapsed eleven-of-thirteen at ``neighbors=5`` span 1.44x the
+threshold, while every family that survived as a coherent task spans 1.00x or
+less. This sits between them.
+
+Advisory and provisional. What counts as implausibly wide depends on the same
+``(similarity, neighbors)`` pair that has never been measured against a labelled
+corpus (#2, #16), and thirteen hand-written instructions are not that corpus.
+It attaches a limitation and changes no grouping, so a wrong value costs a
+reviewer one glance rather than a corrupted family."""
+
 DEFAULT_TAIL_RESERVE = 0.3
 
 _TAIL_SLOTS: tuple[SlotKind, ...] = (
@@ -270,6 +290,22 @@ def _cluster(
     ]
 
 
+def _diameter(members: list[_TraceFeatures], distance: Distance) -> tuple[float, str, str]:
+    """The widest distance inside one family, and the two descriptors that span it.
+
+    Reported rather than acted on: naming the pair is what lets a reviewer decide
+    whether the family is one task, and reach for ``split-family`` if it is not.
+    """
+    descriptors = sorted({member.normalized for member in members})
+    widest = (0.0, descriptors[0], descriptors[0])
+    for index, left in enumerate(descriptors):
+        for right in descriptors[index + 1 :]:
+            span = distance(left, right)
+            if span > widest[0]:
+                widest = (span, left, right)
+    return widest
+
+
 def _medoid(members: list[_TraceFeatures], distance: Distance = jaccard_distance) -> str:
     """Find the exact weighted medoid over distinct descriptors, not every trace."""
     by_descriptor: dict[str, list[_TraceFeatures]] = {}
@@ -383,6 +419,7 @@ def mine_task_set(
     similarity: float = DEFAULT_SIMILARITY,
     neighbors: int = DEFAULT_NEIGHBORS,
     tail_reserve: float = DEFAULT_TAIL_RESERVE,
+    diameter_factor: float = DEFAULT_DIAMETER_FACTOR,
     distance: Distance = jaccard_distance,
     proposed_by: Literal["rule", "model", "human"] = "rule",
 ) -> TaskSet:
@@ -402,6 +439,20 @@ def mine_task_set(
         fit, held = _split_by_lineage(members, family_id, held_out)
 
         limitations: list[str] = []
+        span, left, right = _diameter(members, distance)
+        over_merged = span > diameter_factor * (1.0 - similarity)
+        if over_merged:
+            # Every edge cleared the threshold; the component did not. Verifiers
+            # are drafted per family, so an over-merged one is read for terminal
+            # evidence across unrelated tasks and keyed to whichever value was
+            # most common. Fragmentation is recoverable with merge-families;
+            # this is not visible at all unless it is said out loud.
+            limitations.append(
+                f"widest pair inside this family is {span:.2f} apart, over "
+                f"{diameter_factor:g}x the {1.0 - similarity:.2f} that admitted any "
+                f"single link: {left!r} vs {right!r}; mutual-kNN bounds each edge "
+                "but not the span of the component, so check these are one task"
+            )
         if not held and len(members) > 1:
             limitations.append(
                 "every trace shares one lineage group; no held-out split is possible "
@@ -423,6 +474,8 @@ def mine_task_set(
                 fit_trace_ids=fit,
                 held_out_trace_ids=held,
                 proposed_by=proposed_by,
+                diameter=span,
+                over_merged=over_merged,
                 limitations=tuple(limitations),
             )
         )
