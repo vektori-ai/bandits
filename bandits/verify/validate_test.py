@@ -203,3 +203,79 @@ def test_a_validation_round_trips_through_the_derived_store(tmp_path, address) -
 
     assert envelope.kind == "validation"
     assert load_validation(envelope.artifact_id, store) == validation
+
+
+def _validate(address, label_set, label_set_id=None, draft=None, task_set=None):
+    analysis, ts, _family, drafted = address
+    return validate_draft(
+        draft or drafted,
+        "draft-1",
+        task_set or ts,
+        analysis.evidence,
+        label_set,
+        label_set_id or compute_label_set_id(label_set),
+    )
+
+
+def test_labels_for_another_family_are_refused_rather_than_measured(address) -> None:
+    """The silent-zero path: every artifact valid, the measurement about nothing."""
+    _analysis, task_set, family, _draft = address
+    other = next(f for f in task_set.families if f.family_id != family.family_id)
+    label_set = _labels(other, lambda t: Verdict.SUCCESS)
+
+    with pytest.raises(ValueError, match="labels family"):
+        _validate(address, label_set)
+
+
+def test_labels_for_another_task_set_are_refused(address) -> None:
+    _analysis, _task_set, family, _draft = address
+    label_set = _labels(family, lambda t: Verdict.SUCCESS, task_set_id="ts-other")
+
+    with pytest.raises(ValueError, match="not the draft's"):
+        _validate(address, label_set)
+
+
+def test_a_label_set_id_that_does_not_match_its_content_is_refused(address) -> None:
+    _analysis, _task_set, family, _draft = address
+    label_set = _labels(family, lambda t: Verdict.SUCCESS)
+
+    with pytest.raises(ValueError, match="does not hash to"):
+        _validate(address, label_set, label_set_id="labels-0000000000000000")
+
+
+def test_a_draft_from_another_analysis_is_refused(address) -> None:
+    analysis, task_set, family, draft = address
+    stray = draft.replace(analysis_id="analysis-somewhere-else")
+
+    with pytest.raises(ValueError, match="do not describe the same corpus"):
+        _validate(address, _labels(family, lambda t: Verdict.SUCCESS), draft=stray)
+
+
+def test_labels_naming_no_trace_in_the_family_are_refused(address) -> None:
+    """Right family, right task set, but no label lands on a family trace."""
+    _analysis, _task_set, family, _draft = address
+    label_set = LabelSet(
+        task_set_id="ts-1",
+        family_id=family.family_id,
+        labels=(
+            make_label(
+                trace_id="trace-not-in-this-family",
+                family_id=family.family_id,
+                verdict=Verdict.SUCCESS,
+                labeler="owner",
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="nothing would be measured"):
+        _validate(address, label_set)
+
+
+def test_a_label_set_holding_only_unclear_verdicts_still_validates(address) -> None:
+    """Nothing adjudicated is a thin corpus, which the limitations already report."""
+    _analysis, _task_set, family, _draft = address
+
+    validation = _validate(address, _labels(family, lambda t: Verdict.UNCLEAR))
+
+    assert validation.labels_used == 0
+    assert validation.unclear_labels == len(family.trace_ids)
