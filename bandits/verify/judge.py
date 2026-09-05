@@ -23,6 +23,7 @@ import urllib.error
 import urllib.request
 from collections import Counter
 from collections.abc import Callable, Sequence
+from pathlib import Path
 
 from pydantic import Field, model_validator
 
@@ -210,7 +211,17 @@ def fireworks_completion(model: str, prompt: str, temperature: float) -> str:
     """Call Fireworks. The key is read per call so it is never held in an artifact."""
     api_key = os.environ.get("FIREWORKS_API_KEY")
     if not api_key:
-        raise JudgeError("FIREWORKS_API_KEY is not set")
+        # Keep local dogfooding one command wide without executing arbitrary
+        # shell from .env. Only the one key this backend owns is read.
+        env_path = Path(".env")
+        if env_path.is_file():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                key, separator, value = line.partition("=")
+                if separator and key.strip() == "FIREWORKS_API_KEY":
+                    api_key = value.strip().strip("'\"")
+                    break
+    if not api_key:
+        raise JudgeError("FIREWORKS_API_KEY is not set and was not found in .env")
 
     request = urllib.request.Request(
         "https://api.fireworks.ai/inference/v1/chat/completions",
@@ -218,7 +229,10 @@ def fireworks_completion(model: str, prompt: str, temperature: float) -> str:
             {
                 "model": model,
                 "temperature": temperature,
-                "max_tokens": 700,
+                # Reasoning models may spend a substantial part of this budget
+                # before emitting their short visible answer. Seven hundred
+                # truncated real structured SFT reviews halfway through JSON.
+                "max_tokens": 2000,
                 "messages": [{"role": "user", "content": prompt}],
             }
         ).encode(),
