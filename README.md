@@ -8,15 +8,15 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![uv](https://img.shields.io/badge/managed%20with-uv-DE5FE9?logo=uv)](https://docs.astral.sh/uv/)
 
-Bandits turns real agent runs into SFT data, eval cases, and tested success checks—without hiding missing evidence.
+Bandits turns real agent runs into SFT data, eval cases, and tested success checks without hiding missing evidence.
 
-[Why Bandits?](#why-bandits) · [Quickstart](#quickstart) · [Workflows](#core-workflows) · [Trust model](#trust-is-a-data-model) · [CLI](#cli-reference)
+[Why Bandits?](#why-bandits) · [Quickstart](#quickstart) · [Workflow](#workflow) · [Trust model](#trust-is-a-data-model) · [CLI](#cli-reference)
 
 </div>
 
 ---
 
-Agent traces already contain the work: the request, the decisions, the tool calls, and the result. Bandits turns that history into a chain of evidence—from raw runs to reviewed eval and training data.
+Agent traces already contain the work: the request, the decisions, the tool calls, and the result. Bandits turns that history into a chain of evidence, from raw runs to reviewed eval and training data.
 
 <div align="center">
   <img src="docs/images/bandits-workflow.webp" alt="Bandits evidence pipeline: OTLP, chat JSON, and Claude Code traces are normalized into an immutable corpus and content-addressed store; analysis extracts tasks, evidence, and families; verifiers cycle through drafting, replay, labeling, and validation before human review gates held-out eval, fit SFT, and unresolved outputs." width="100%" />
@@ -59,43 +59,9 @@ Bandits writes immutable artifacts to `.bandits/` in the selected project direct
 | Chat transcripts | `--source chat-json` | One JSON conversation or an array of conversations |
 | Claude Code | `--source claude-code` | One session JSONL file or a directory of sessions |
 
-The input format is always explicit—Bandits does not guess and risk accepting a plausible-looking misparse.
+The input format is always explicit. Bandits does not guess and risk accepting a plausible-looking misparse.
 
-## Core workflows
-
-### Direct SFT curation
-
-Use this when you want a high-quality demonstration set without first defining task families and deterministic verifiers.
-
-```bash
-export FIREWORKS_API_KEY="..."
-
-uv run bandits build-sft corpus-67e49fdc2268c1e5 \
-  --output bandits-output/dataset
-```
-
-Omit `--trace` to review every trace, or repeat it to select specific runs:
-
-```bash
-uv run bandits build-sft <corpus-id> \
-  --trace <trace-id> \
-  --trace <trace-id> \
-  --samples 3 \
-  --output bandits-output/dataset
-```
-
-Each trajectory receives multiple independent model reviews plus deterministic transcript-integrity checks. A favorable model review cannot override missing tool results, malformed action/result pairs, recorded error paths, or other structural defects.
-
-| Output | Meaning |
-| --- | --- |
-| `sft.jsonl` | Clear, supported, structurally sound demonstrations |
-| `review.jsonl` | Ambiguous cases that deserve a person’s attention |
-| `rejected.jsonl` | Failed semantic or deterministic quality gates |
-| `selection-report.json` | Counts, model identity, and corpus lineage |
-
-The default review backend is Fireworks. `FIREWORKS_API_KEY` may be set in the environment or a local `.env` file; keys are read at call time and are not stored in artifacts.
-
-### Reviewed verifiers and gated exports
+## Workflow
 
 Use this when success needs to be explainable, measured, and tied to an owner decision.
 
@@ -211,7 +177,6 @@ These are demonstration-quality gates, not claims that a successful outcome alon
 | `validate-verifier` | Measure fit/held-out agreement and probe gameability |
 | `review-verifier` | Record explicit acceptance of a calibrated verifier |
 | `judge` | Sample a rubric judge for unstructured outcomes |
-| `build-sft` | Build model-reviewed SFT buckets directly from a corpus |
 | `export` | Write verifier-gated eval or SFT JSONL plus quarantine |
 
 Run `uv run bandits <command> --help` for every option.
@@ -237,7 +202,7 @@ uv run ruff check .
 uv run pytest --cov=bandits --cov-report=term-missing
 ```
 
-The test suite exercises ingestion fidelity, redaction, content-addressed storage, task mining, verifier execution and validation, model-judge behavior, and both export paths.
+The test suite exercises ingestion fidelity, redaction, content-addressed storage, task mining, verifier execution and validation, model-judge behavior, and both verifier-gated export formats.
 
 ## Project map
 
@@ -246,11 +211,11 @@ bandits/
 ├── ingest/      # OTLP, chat JSON, and Claude Code adapters
 ├── analyze/     # task extraction, evidence, embeddings, and families
 ├── verify/      # draft, execute, interview, validate, review, and judge
-├── export/      # direct SFT, verifier-gated SFT, and portable eval JSONL
+├── export/      # verifier-gated SFT and portable eval JSONL
 ├── traces.py    # immutable canonical trace contracts
 ├── store.py     # content-addressed corpus and derived-artifact storage
 ├── redact.py    # deterministic redaction policies
 └── cli.py       # Typer command-line interface
 ```
 
-Bandits is intentionally domain-agnostic: coding agents, support workflows, browser automation, research, API agents, and other tool-using systems all enter through the same evidence model. Domain-specific definitions of success belong in reviewable verifier checks—not hidden inside the trace format.
+Bandits is intentionally domain-agnostic: coding agents, support workflows, browser automation, research, API agents, and other tool-using systems all enter through the same evidence model. Domain-specific definitions of success belong in reviewable verifier checks, not hidden inside the trace format.
