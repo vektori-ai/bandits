@@ -24,9 +24,12 @@ from bandits.analyze import (
 )
 from bandits.export import (
     Partition,
+    build_direct_sft,
     build_eval_export,
     build_sft_export,
+    save_direct_sft,
     save_export,
+    write_direct_sft,
     write_jsonl,
 )
 from bandits.ingest import CANONICAL_SOURCES, UnknownSourceError, load_corpus
@@ -54,6 +57,7 @@ from bandits.verify import (
     start_interview,
 )
 from bandits.verify.judge import (
+    DEFAULT_MODEL,
     JudgeError,
     Rubric,
     judge_traces,
@@ -708,6 +712,42 @@ def export_command(
         console.print(f"[yellow]accepted risk:[/yellow] {code}")
     for warning in bundle.manifest.warnings:
         console.print(f"[yellow]warning:[/yellow] {warning}")
+
+
+@app.command(name="build-sft")
+def build_sft_command(
+    corpus_id: str,
+    trace_ids: list[str] = typer.Option(
+        None, "--trace", help="Trace to consider. Repeat to select several; omit for all."
+    ),
+    output: Path = typer.Option(..., "--output", help="Directory for the three review buckets."),
+    model: str = typer.Option(DEFAULT_MODEL, "--model", help="Fireworks review model."),
+    samples: int = typer.Option(3, "--samples", min=1, help="Independent LLM reviews per trace."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Build an LLM-reviewed SFT dataset directly from normalized traces."""
+    try:
+        corpus = ArtifactStore(project / ".bandits").read(corpus_id)
+        bundle = build_direct_sft(
+            corpus,
+            corpus_id,
+            trace_ids=trace_ids or (),
+            model=model,
+            samples=samples,
+        )
+        envelope = save_direct_sft(bundle, _derived(project))
+        paths = write_direct_sft(bundle, output)
+    except (FileNotFoundError, ValueError, JudgeError) as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"dataset_id: {envelope.artifact_id}")
+    console.print(f"model:      {bundle.review_model}")
+    console.print(f"reviewed:   {len(bundle.candidates)}")
+    console.print(f"accepted:   {len(bundle.accepted)} -> {paths['accepted']}")
+    console.print(f"review:     {len(bundle.review)} -> {paths['review']}")
+    console.print(f"rejected:   {len(bundle.rejected)} -> {paths['rejected']}")
+    console.print(f"report:     {paths['report']}")
 
 
 @app.command()

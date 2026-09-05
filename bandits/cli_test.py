@@ -6,6 +6,7 @@ from typer.testing import CliRunner
 
 from bandits.analyze import load_analysis, load_task_set
 from bandits.cli import app
+from bandits.export import direct_sft
 from bandits.ingest.otlp import load_otlp
 from bandits.store import DerivedStore, compute_artifact_id
 from bandits.verify import draft_verifiers, load_interview, load_verifier_draft, save_verifier_draft
@@ -520,3 +521,44 @@ def test_export_rejects_unknown_format_before_writing(tmp_path) -> None:
 
     assert result.exit_code == 1
     assert not output.exists()
+
+
+def test_build_sft_selects_traces_and_writes_three_review_buckets(tmp_path, monkeypatch) -> None:
+    runner.invoke(
+        app, ["ingest", str(FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
+    )
+    artifact_id = compute_artifact_id(load_otlp(FIXTURE))
+    reply = (
+        '{"outcome":"success","task_clarity":5,"demonstrated_success":5,'
+        '"trajectory_quality":5,"self_contained":4,"recommendation":"accept",'
+        '"rationale":"clear successful run","concerns":[]}'
+    )
+    monkeypatch.setattr(
+        direct_sft,
+        "fireworks_completion",
+        lambda model, prompt, temperature: reply,
+    )
+    output = tmp_path / "direct-dataset"
+
+    result = runner.invoke(
+        app,
+        [
+            "build-sft",
+            artifact_id,
+            "--trace",
+            "trace-1",
+            "--samples",
+            "1",
+            "--output",
+            str(output),
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "reviewed:   1" in result.stdout
+    assert (output / "sft.jsonl").exists()
+    assert (output / "review.jsonl").exists()
+    assert (output / "rejected.jsonl").exists()
+    assert (output / "selection-report.json").exists()

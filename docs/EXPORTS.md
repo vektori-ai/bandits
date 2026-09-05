@@ -1,5 +1,32 @@
 # Eval and SFT exports
 
+## Direct, model-reviewed SFT
+
+The default SFT workflow starts from a normalized corpus. Bandits reconstructs
+each selected trajectory, asks a sampled model judge whether the task is clear,
+the outcome is supported, and the behavior is worth imitating, then applies
+deterministic transcript-integrity gates. The user reviews the resulting
+buckets; they do not have to create task families, labels, or verifiers first.
+
+```bash
+bandits build-sft <corpus-id> \
+  --trace <trace-id> --trace <trace-id> \
+  --output bandits-output/dataset
+```
+
+Omit `--trace` to consider the complete corpus. The command uses the Fireworks
+judge by default and reads `FIREWORKS_API_KEY` from the environment or the local
+`.env` file. It writes `sft.jsonl`, `review.jsonl`, `rejected.jsonl`, and
+`selection-report.json`. Every row carries the individual model samples, their
+agreement, the prompt digest, structural findings, warnings, and source trace
+lineage.
+
+The deterministic gates remain authoritative for facts a model must not invent:
+missing tool results, malformed action/result pairing, absent targets, and
+recorded error paths. A favorable model review cannot override those defects.
+
+## Verifier-gated exports
+
 Bandits exports only through an explicitly accepted verifier. Validation alone
 caps a verifier at `calibrated`; `review-verifier` records the separate owner
 decision that promotes one measured verifier.
@@ -28,7 +55,8 @@ bandits review-verifier <verifier-draft-id> \
   --acceptance-id <ticket-or-review-id>
 ```
 
-The returned `reviewed-verifier-*` id gates both export formats:
+The returned `reviewed-verifier-*` id gates evaluation exports and the stricter,
+verifier-backed SFT export path:
 
 ```bash
 bandits export <task-set-id> --format eval \

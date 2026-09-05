@@ -215,7 +215,11 @@ automatic verifier or human rubric.
 #### Supervised fine-tuning example
 
 Requires a successful, high-quality trajectory. Output is the task paired with
-the selected action/message sequence in a target training format.
+the selected action/message sequence in a target training format. The default
+workflow uses a sampled model review for semantic success and demonstration
+quality, surrounded by deterministic transcript-integrity checks. It does not
+require task-family mining or a reviewed verifier; those remain available when
+an owner needs a stricter, auditable success claim.
 
 #### Preference example
 
@@ -259,6 +263,12 @@ bandits-output/
     rl_candidates.jsonl
   unresolved.jsonl
 ```
+
+For the focused trace-to-SFT workflow, `bandits build-sft <corpus-id> --output
+<directory>` directly produces `sft.jsonl`, `review.jsonl`, `rejected.jsonl`,
+and `selection-report.json`. The review and rejected buckets are first-class
+outputs so a user can inspect what the model was uncertain about and improve the
+selection policy.
 
 Every output row links back to its source trace and records whether values were
 observed directly, deterministically derived, inferred by a model, or supplied
