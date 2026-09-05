@@ -22,6 +22,7 @@ from bandits.analyze.models import (
     CorpusAnalysis,
     Evidence,
     EvidenceKind,
+    FamilyCoherence,
     MissingSlot,
     SelectedTask,
     SlotKind,
@@ -429,6 +430,12 @@ def mine_task_set(
 
     if neighbors < 1:
         raise ValueError("neighbors must be at least 1")
+    if not 0.0 <= similarity <= 1.0:
+        # A similarity outside [0, 1] inverts the link threshold, which silently
+        # admits every pair and reports every family as over-merged.
+        raise ValueError(f"similarity must be between 0 and 1, got {similarity}")
+    if diameter_factor <= 0:
+        raise ValueError(f"diameter_factor must be positive, got {diameter_factor}")
     clusters = _cluster(features, similarity, neighbors, distance)
     families: list[TaskFamily] = []
     family_of: dict[str, str] = {}
@@ -440,8 +447,13 @@ def mine_task_set(
 
         limitations: list[str] = []
         span, left, right = _diameter(members, distance)
-        over_merged = span > diameter_factor * (1.0 - similarity)
-        if over_merged:
+        coherence = FamilyCoherence(
+            diameter=span,
+            link_threshold=1.0 - similarity,
+            diameter_factor=diameter_factor,
+            widest_pair=(left, right),
+        )
+        if coherence.over_merged:
             # Every edge cleared the threshold; the component did not. Verifiers
             # are drafted per family, so an over-merged one is read for terminal
             # evidence across unrelated tasks and keyed to whichever value was
@@ -474,8 +486,7 @@ def mine_task_set(
                 fit_trace_ids=fit,
                 held_out_trace_ids=held,
                 proposed_by=proposed_by,
-                diameter=span,
-                over_merged=over_merged,
+                coherence=coherence,
                 limitations=tuple(limitations),
             )
         )
@@ -604,7 +615,15 @@ def merge_families(task_set: TaskSet, family_ids: tuple[str, ...]) -> TaskSet:
         held_out_trace_ids=tuple(sorted({t for f in merged_from for t in f.held_out_trace_ids})),
         proposed_by="human",
         review_status="merged",
-        limitations=tuple(sorted({limit for f in merged_from for limit in f.limitations})),
+        # Deliberately dropped: the merged family is wider than either input, and
+        # recomputing needs the distance function that grouped them, which a
+        # correction does not have. A stale narrower figure would understate it.
+        coherence=None,
+        limitations=(
+            *sorted({limit for f in merged_from for limit in f.limitations}),
+            "coherence was not recomputed after this merge; the family is at least "
+            "as wide as the widest it was built from",
+        ),
     )
     remap = {fid: survivor.family_id for fid in family_ids}
     families = tuple(
@@ -653,7 +672,13 @@ def split_family(task_set: TaskSet, family_id: str, analysis: CorpusAnalysis) ->
             ),
             proposed_by="human",
             review_status="split",
-            limitations=target.limitations,
+            # A subfamily is narrower than the family it came from, so the
+            # parent's measurement would overstate it; there is no distance
+            # function here to recompute one with.
+            coherence=None,
+            limitations=tuple(
+                limit for limit in target.limitations if not limit.startswith("widest pair")
+            ),
         )
         for descriptor, group in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
     ]

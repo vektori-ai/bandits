@@ -352,7 +352,11 @@ def test_a_transitively_chained_family_is_reported_as_over_merged() -> None:
 
     family = next(f for f in task_set.families if f.workload_mass == 4)
     assert family.over_merged
-    assert family.diameter == pytest.approx(0.75)
+    assert family.coherence.diameter == pytest.approx(0.75)
+    assert family.coherence.widest_pair == (
+        normalize_instruction(_CHAIN[0]),
+        normalize_instruction(_CHAIN[3]),
+    )
 
 
 def test_the_flag_names_the_pair_that_spans_the_family() -> None:
@@ -374,7 +378,7 @@ def test_a_family_no_wider_than_one_legal_link_is_not_flagged() -> None:
 
     family = next(f for f in task_set.families if f.workload_mass == 2)
     assert not family.over_merged
-    assert family.diameter == pytest.approx(0.25)
+    assert family.coherence.diameter == pytest.approx(0.25)
 
 
 def test_flagging_changes_no_grouping(task_set: TaskSet, analysis) -> None:
@@ -383,3 +387,40 @@ def test_flagging_changes_no_grouping(task_set: TaskSet, analysis) -> None:
 
     assert [f.trace_ids for f in loose.families] == [f.trace_ids for f in task_set.families]
     assert not any(f.over_merged for f in loose.families)
+
+
+def test_invalid_clustering_parameters_are_refused(analysis) -> None:
+    """An out-of-range similarity inverts the threshold and flags every family."""
+    analysis_id = compute_analysis_id(analysis)
+
+    with pytest.raises(ValueError, match="similarity must be between 0 and 1"):
+        mine_task_set(analysis, analysis_id, similarity=1.5)
+    with pytest.raises(ValueError, match="diameter_factor must be positive"):
+        mine_task_set(analysis, analysis_id, diameter_factor=0.0)
+
+
+def test_a_merge_says_its_coherence_was_not_recomputed(task_set: TaskSet) -> None:
+    """A merged family is wider than either input; a stale figure would understate it."""
+    ids = tuple(f.family_id for f in task_set.families[:2])
+
+    merged = merge_families(task_set, ids)
+
+    survivor = next(f for f in merged.families if f.family_id in ids)
+    assert survivor.coherence is None
+    assert not survivor.over_merged
+    assert any("not recomputed" in limit for limit in survivor.limitations)
+
+
+def test_a_split_drops_the_parents_over_merge_finding(analysis) -> None:
+    """The finding was about the parent's span, which no subfamily still has."""
+    task_set = mine_task_set(
+        _chain_analysis(4), "analysis-x", budget=10, similarity=0.7, distance=_chain_distance
+    )
+    flagged = next(f for f in task_set.families if f.over_merged)
+
+    split = split_family(task_set, flagged.family_id, _chain_analysis(4))
+
+    replacements = [f for f in split.families if f.review_status == "split"]
+    assert replacements
+    assert all(f.coherence is None for f in replacements)
+    assert not any(limit.startswith("widest pair") for f in replacements for limit in f.limitations)

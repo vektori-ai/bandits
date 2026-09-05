@@ -257,10 +257,19 @@ def _report(task_set, envelope_id: str) -> None:
     # large healthy group. Verifiers are drafted per family, so it has to be
     # said here rather than only under `families --family`.
     for family in task_set.families:
-        if not family.over_merged:
+        # Read off the measurement, not off the limitation prose: a family also
+        # carries limitations about lineage and splits, and printing those under
+        # an over-merged heading would attribute them to the wrong finding.
+        coherence = family.coherence
+        if coherence is None or not coherence.over_merged:
             continue
-        for limitation in family.limitations:
-            console.print(f"[yellow]over-merged[/yellow] {family.family_id}: {limitation}")
+        left, right = coherence.widest_pair
+        console.print(
+            f"[yellow]over-merged[/yellow] {family.family_id}: widest pair is "
+            f"{coherence.diameter:.2f} apart, over {coherence.diameter_factor:g}x the "
+            f"{coherence.link_threshold:.2f} that admitted any single link — "
+            f"{left!r} vs {right!r}"
+        )
 
     for limitation in task_set.limitations:
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
