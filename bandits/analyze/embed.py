@@ -20,9 +20,14 @@ import os
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING
 
+from bandits.analyze.families import normalize_instruction
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract
+
+if TYPE_CHECKING:
+    from bandits.analyze.models import CorpusAnalysis
 
 DEFAULT_MODEL = "accounts/fireworks/models/qwen3-embedding-8b"
 DEFAULT_SIMILARITY = 0.6
@@ -69,7 +74,12 @@ def fireworks_embedder(model: str, texts: Sequence[str]) -> list[list[float]]:
     except (urllib.error.URLError, TimeoutError) as exc:
         raise EmbeddingError(f"embedding request failed: {exc}") from exc
 
-    ordered = sorted(payload["data"], key=lambda item: item["index"])
+    try:
+        ordered = sorted(payload["data"], key=lambda item: item["index"])
+    except (KeyError, TypeError) as exc:
+        # A 200 carrying an error body — a quota message, a changed schema —
+        # is still a failure, and must surface as one rather than a traceback.
+        raise EmbeddingError(f"embedding response was not usable: {payload}") from exc
     if len(ordered) != len(texts):
         raise EmbeddingError(f"asked for {len(texts)} vectors, received {len(ordered)}")
     return [item["embedding"] for item in ordered]
@@ -143,3 +153,14 @@ def save_cache(cache: EmbeddingCache, store: DerivedStore, corpus_id: str) -> De
 
 def load_cache(cache_id: str, store: DerivedStore) -> EmbeddingCache:
     return EmbeddingCache.model_validate_json(store.read_payload(cache_id))
+
+
+def descriptors(analysis: CorpusAnalysis) -> list[str]:
+    """The exact strings clustering will compare, so the cache covers all of them.
+
+    Grouping runs over normalized descriptors rather than raw instructions, and
+    :func:`embedding_distance` treats anything absent as maximally far. Deriving
+    this list anywhere but here would let the two drift apart and silently push
+    every uncovered pair to distance 1.0.
+    """
+    return sorted({normalize_instruction(t.instruction) for t in analysis.tasks if t.instruction})

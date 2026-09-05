@@ -37,7 +37,12 @@ DEFAULT_SIMILARITY = 0.7
 """Grouping stays conservative: two instructions must share most of their shape."""
 
 DEFAULT_NEIGHBORS = 3
-"""Maximum neighbors per descriptor in the mutual-kNN grouping graph."""
+"""Maximum neighbors per descriptor in the mutual-kNN grouping graph.
+
+Chosen for lexical grouping and carried over to the embedding backend unmeasured.
+Raising it reduces fragmentation but widens the transitive components that
+:func:`_cluster` builds, so it cannot be tuned on its own — the two effects need
+choosing together against a labelled corpus."""
 
 DEFAULT_TAIL_RESERVE = 0.3
 
