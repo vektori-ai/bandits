@@ -12,7 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from bandits.analyze import analyze_corpus, compute_analysis_id, mine_task_set
+from bandits.analyze import (
+    analyze_corpus,
+    compute_analysis_id,
+    compute_task_set_id,
+    mine_task_set,
+)
 from bandits.ingest import load_corpus
 from bandits.labels import LabelSet, Verdict, compute_label_set_id, make_label
 from bandits.store import DerivedStore
@@ -36,11 +41,16 @@ def address():
     analysis = analyze_corpus(load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp"))
     task_set = mine_task_set(analysis, compute_analysis_id(analysis), budget=10)
     family = next(f for f in task_set.families if "address" in f.descriptor)
-    draft = draft_verifiers(task_set, "ts-1", analysis, family.family_id, limit=6)
+    # The real id, not a placeholder: validate_draft now proves the artifacts it
+    # was handed are the ones the draft was built against.
+    draft = draft_verifiers(
+        task_set, compute_task_set_id(task_set), analysis, family.family_id, limit=6
+    )
     return analysis, task_set, family, draft
 
 
-def _labels(family, verdict_for, task_set_id: str = "ts-1") -> LabelSet:
+def _labels(family, verdict_for, task_set_id: str | None = None, task_set=None) -> LabelSet:
+    task_set_id = task_set_id or compute_task_set_id(task_set)
     return LabelSet(
         task_set_id=task_set_id,
         family_id=family.family_id,
@@ -59,12 +69,12 @@ def _labels(family, verdict_for, task_set_id: str = "ts-1") -> LabelSet:
 def _validated(address, verdict_for=None):
     analysis, task_set, family, draft = address
     verdict_for = verdict_for or (lambda t: Verdict.SUCCESS if t == SUCCEEDED else Verdict.FAILURE)
-    label_set = _labels(family, verdict_for)
+    label_set = _labels(family, verdict_for, task_set=task_set)
     return validate_draft(
         draft,
         "draft-1",
         task_set,
-        analysis.evidence,
+        analysis,
         label_set,
         compute_label_set_id(label_set),
     )
@@ -112,14 +122,17 @@ def test_a_run_the_verifier_cannot_score_is_not_a_disagreement() -> None:
     analysis = analyze_corpus(load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp"))
     task_set = mine_task_set(analysis, compute_analysis_id(analysis), budget=10)
     family = next(f for f in task_set.families if "refund" in f.descriptor)
-    draft = draft_verifiers(task_set, "ts-1", analysis, family.family_id, limit=6)
+    draft = draft_verifiers(
+        task_set, compute_task_set_id(task_set), analysis, family.family_id, limit=6
+    )
     label_set = _labels(
         family,
         lambda t: Verdict.FAILURE if t in ("refund-4", "refund-9") else Verdict.SUCCESS,
+        task_set=task_set,
     )
 
     validation = validate_draft(
-        draft, "draft-1", task_set, analysis.evidence, label_set, compute_label_set_id(label_set)
+        draft, "draft-1", task_set, analysis, label_set, compute_label_set_id(label_set)
     )
 
     unscored = [a for a in validation.agreements if a.unscored]
@@ -139,7 +152,7 @@ def test_an_unlabeled_held_out_side_is_called_out(address) -> None:
     """Otherwise a fit-only agreement rate reads as if it were an honest estimate."""
     analysis, task_set, family, draft = address
     label_set = LabelSet(
-        task_set_id="ts-1",
+        task_set_id=compute_task_set_id(task_set),
         family_id=family.family_id,
         labels=tuple(
             make_label(
@@ -153,7 +166,7 @@ def test_an_unlabeled_held_out_side_is_called_out(address) -> None:
     )
 
     validation = validate_draft(
-        draft, "draft-1", task_set, analysis.evidence, label_set, compute_label_set_id(label_set)
+        draft, "draft-1", task_set, analysis, label_set, compute_label_set_id(label_set)
     )
 
     assert any("not an honest estimate" in limit for limit in validation.limitations)
@@ -164,11 +177,13 @@ def test_forging_a_before_and_after_pair_costs_more_than_writing_one_field() -> 
     analysis = analyze_corpus(load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp"))
     task_set = mine_task_set(analysis, compute_analysis_id(analysis), budget=10)
     family = next(f for f in task_set.families if "refund" in f.descriptor)
-    draft = draft_verifiers(task_set, "ts-1", analysis, family.family_id, limit=6)
-    label_set = _labels(family, lambda t: Verdict.SUCCESS)
+    draft = draft_verifiers(
+        task_set, compute_task_set_id(task_set), analysis, family.family_id, limit=6
+    )
+    label_set = _labels(family, lambda t: Verdict.SUCCESS, task_set=task_set)
 
     validation = validate_draft(
-        draft, "draft-1", task_set, analysis.evidence, label_set, compute_label_set_id(label_set)
+        draft, "draft-1", task_set, analysis, label_set, compute_label_set_id(label_set)
     )
     cost = {result.hypothesis.split()[0]: result.forged_facts for result in validation.gameability}
 
@@ -205,13 +220,13 @@ def test_a_validation_round_trips_through_the_derived_store(tmp_path, address) -
     assert load_validation(envelope.artifact_id, store) == validation
 
 
-def _validate(address, label_set, label_set_id=None, draft=None, task_set=None):
-    analysis, ts, _family, drafted = address
+def _validate(address, label_set, label_set_id=None, draft=None, task_set=None, analysis=None):
+    built_analysis, built_task_set, _family, drafted = address
     return validate_draft(
         draft or drafted,
         "draft-1",
-        task_set or ts,
-        analysis.evidence,
+        task_set or built_task_set,
+        analysis or built_analysis,
         label_set,
         label_set_id or compute_label_set_id(label_set),
     )
@@ -221,7 +236,7 @@ def test_labels_for_another_family_are_refused_rather_than_measured(address) -> 
     """The silent-zero path: every artifact valid, the measurement about nothing."""
     _analysis, task_set, family, _draft = address
     other = next(f for f in task_set.families if f.family_id != family.family_id)
-    label_set = _labels(other, lambda t: Verdict.SUCCESS)
+    label_set = _labels(other, lambda t: Verdict.SUCCESS, task_set=task_set)
 
     with pytest.raises(ValueError, match="labels family"):
         _validate(address, label_set)
@@ -236,26 +251,54 @@ def test_labels_for_another_task_set_are_refused(address) -> None:
 
 
 def test_a_label_set_id_that_does_not_match_its_content_is_refused(address) -> None:
-    _analysis, _task_set, family, _draft = address
-    label_set = _labels(family, lambda t: Verdict.SUCCESS)
+    _analysis, task_set, family, _draft = address
+    label_set = _labels(family, lambda t: Verdict.SUCCESS, task_set=task_set)
 
     with pytest.raises(ValueError, match="does not hash to"):
         _validate(address, label_set, label_set_id="labels-0000000000000000")
 
 
 def test_a_draft_from_another_analysis_is_refused(address) -> None:
-    analysis, task_set, family, draft = address
+    _analysis, task_set, family, draft = address
     stray = draft.replace(analysis_id="analysis-somewhere-else")
 
-    with pytest.raises(ValueError, match="do not describe the same corpus"):
-        _validate(address, _labels(family, lambda t: Verdict.SUCCESS), draft=stray)
+    with pytest.raises(ValueError, match="but the supplied one hashes to"):
+        _validate(
+            address, _labels(family, lambda t: Verdict.SUCCESS, task_set=task_set), draft=stray
+        )
+
+
+def test_a_task_set_that_is_not_the_one_the_draft_was_built_against_is_refused(address) -> None:
+    """Ids can agree while the objects do not; only the content settles it."""
+    analysis, task_set, family, _draft = address
+    other = mine_task_set(analysis, compute_analysis_id(analysis), budget=3)
+
+    with pytest.raises(ValueError, match="but the supplied one hashes to"):
+        _validate(
+            address,
+            _labels(family, lambda t: Verdict.SUCCESS, task_set=task_set),
+            task_set=other,
+        )
+
+
+def test_evidence_from_another_analysis_is_refused(address) -> None:
+    """The draft's evidence has to be the analysis it was drafted from."""
+    _analysis, task_set, family, _draft = address
+    elsewhere = analyze_corpus(load_corpus(FIXTURES / "traces.otlp.jsonl", "otlp"))
+
+    with pytest.raises(ValueError, match="but the supplied one hashes to"):
+        _validate(
+            address,
+            _labels(family, lambda t: Verdict.SUCCESS, task_set=task_set),
+            analysis=elsewhere,
+        )
 
 
 def test_labels_naming_no_trace_in_the_family_are_refused(address) -> None:
     """Right family, right task set, but no label lands on a family trace."""
-    _analysis, _task_set, family, _draft = address
+    _analysis, task_set, family, _draft = address
     label_set = LabelSet(
-        task_set_id="ts-1",
+        task_set_id=compute_task_set_id(task_set),
         family_id=family.family_id,
         labels=(
             make_label(
@@ -267,15 +310,45 @@ def test_labels_naming_no_trace_in_the_family_are_refused(address) -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="nothing would be measured"):
+    with pytest.raises(ValueError, match="outside family"):
         _validate(address, label_set)
 
 
-def test_a_label_set_holding_only_unclear_verdicts_still_validates(address) -> None:
-    """Nothing adjudicated is a thin corpus, which the limitations already report."""
-    _analysis, _task_set, family, _draft = address
+def test_a_label_set_mostly_about_other_traces_is_refused(address) -> None:
+    """One overlapping label is not enough: labels_used would count the rest."""
+    _analysis, task_set, family, _draft = address
+    labels = [
+        make_label(
+            trace_id=family.trace_ids[0],
+            family_id=family.family_id,
+            verdict=Verdict.SUCCESS,
+            labeler="owner",
+        ),
+        *(
+            make_label(
+                trace_id=f"foreign-{index}",
+                family_id=family.family_id,
+                verdict=Verdict.SUCCESS,
+                labeler="owner",
+            )
+            for index in range(9)
+        ),
+    ]
+    label_set = LabelSet(
+        task_set_id=compute_task_set_id(task_set),
+        family_id=family.family_id,
+        labels=tuple(labels),
+    )
 
-    validation = _validate(address, _labels(family, lambda t: Verdict.UNCLEAR))
+    with pytest.raises(ValueError, match="outside family"):
+        _validate(address, label_set)
+
+
+def test_a_correctly_scoped_all_unclear_label_set_still_validates(address) -> None:
+    """Unclear is a thin corpus, not a lineage error, once the traces are right."""
+    _analysis, task_set, family, _draft = address
+
+    validation = _validate(address, _labels(family, lambda t: Verdict.UNCLEAR, task_set=task_set))
 
     assert validation.labels_used == 0
     assert validation.unclear_labels == len(family.trace_ids)
