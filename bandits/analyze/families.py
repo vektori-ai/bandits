@@ -793,8 +793,57 @@ def mine_task_set(
     )
 
 
-def merge_families(task_set: TaskSet, family_ids: tuple[str, ...]) -> TaskSet:
-    """Combine families a reviewer says are one task. Recorded as a human correction."""
+def _repair_straddles(
+    members: list[_TraceFeatures],
+    fit: set[str],
+    held: set[str],
+    merged: dict[str, str],
+    family_id: str,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Move whole components off the boundary, leaving everything else where it is.
+
+    A correction is not a re-mine. Redrawing the split from scratch would move
+    traces that were never in conflict, and a verifier already drafted against
+    the old fit side would silently be measuring against runs it had seen. So
+    only a component actually sitting on both sides is moved, and it is moved
+    whole — which is the same rule :func:`_split_by_lineage` follows.
+
+    The larger side wins, so the fewest traces move; an even split is decided by
+    the same stable hash the original partition used, so the repair is
+    reproducible rather than dependent on which family was merged first.
+    """
+    grouped: dict[str, set[str]] = {}
+    for feature in members:
+        key = merged.get(feature.lineage_group, feature.lineage_group)
+        grouped.setdefault(key, set()).add(feature.trace_id)
+
+    moved: list[str] = []
+    for key in sorted(grouped):
+        traces = grouped[key]
+        in_fit, in_held = traces & fit, traces & held
+        if not in_fit or not in_held:
+            continue
+        to_fit = len(in_fit) > len(in_held) or (
+            len(in_fit) == len(in_held) and _stable_fraction(family_id, key) < 0.5
+        )
+        target, other = (fit, held) if to_fit else (held, fit)
+        target |= traces
+        other -= traces
+        moved.append(key)
+    return tuple(sorted(fit)), tuple(sorted(held)), tuple(moved)
+
+
+def merge_families(
+    task_set: TaskSet, family_ids: tuple[str, ...], analysis: CorpusAnalysis
+) -> TaskSet:
+    """Combine families a reviewer says are one task. Recorded as a human correction.
+
+    ``analysis`` is required because a family records which traces it holds and
+    which side each is on, but never which lineage they belong to. Unioning two
+    families' splits without it puts one lineage on both sides whenever the two
+    disagreed about which side it belonged on — reopening exactly the leak
+    grouping closes, through an ordinary reviewer action.
+    """
     known = task_set.family_by_id()
     unknown = [fid for fid in family_ids if fid not in known]
     if unknown:
@@ -806,30 +855,51 @@ def merge_families(task_set: TaskSet, family_ids: tuple[str, ...]) -> TaskSet:
     trace_ids = tuple(sorted({tid for f in merged_from for tid in f.trace_ids}))
     survivor = max(merged_from, key=lambda f: (f.workload_mass, f.family_id))
 
+    features, _ = _features(analysis)
+    members = [f for f in features if f.trace_id in set(trace_ids)]
+    # The edges each family already carried, plus any that only become visible
+    # now these members sit together: two traces of one request in two families
+    # were never compared before. Exact evidence only — the sameness backend is
+    # a mining argument and is not available to a correction.
+    inherited = {edge for f in merged_from for edge in f.duplicate_lineages}
+    edges = sorted(
+        inherited | set(_duplicate_edges(members, None, 1.0)),
+        key=lambda edge: (edge.left, edge.right, edge.trace_ids),
+    )
+    fit, held, moved = _repair_straddles(
+        members,
+        {t for f in merged_from for t in f.fit_trace_ids},
+        {t for f in merged_from for t in f.held_out_trace_ids},
+        _merge_lineages(edges),
+        survivor.family_id,
+    )
+
+    limitations = {limit for f in merged_from for limit in f.limitations}
+    if moved:
+        limitations.add(
+            f"{len(moved)} lineage group(s) sat on both sides of the merged split and were "
+            "moved whole to one side; a verifier measured against the old partition should "
+            "be revalidated"
+        )
+
     merged = TaskFamily(
         family_id=survivor.family_id,
         descriptor=survivor.descriptor,
         trace_ids=trace_ids,
         medoid_trace_id=survivor.medoid_trace_id,
         workload_mass=len(trace_ids),
-        # The split is rebuilt from the union rather than concatenated, so a
-        # lineage group present in two merged families cannot end up on both sides.
-        fit_trace_ids=tuple(sorted({t for f in merged_from for t in f.fit_trace_ids})),
-        held_out_trace_ids=tuple(sorted({t for f in merged_from for t in f.held_out_trace_ids})),
+        fit_trace_ids=fit,
+        held_out_trace_ids=held,
         proposed_by="human",
         review_status="merged",
         # Deliberately dropped: the merged family is wider than either input, and
         # recomputing needs the distance function that grouped them, which a
         # correction does not have. A stale narrower figure would understate it.
         coherence=None,
+        duplicate_lineages=tuple(edges),
         limitations=(
             *sorted(
-                {
-                    limit
-                    for family in merged_from
-                    for limit in family.limitations
-                    if not limit.startswith(_COHERENCE_LIMITATION_PREFIX)
-                }
+                limit for limit in limitations if not limit.startswith(_COHERENCE_LIMITATION_PREFIX)
             ),
             _COHERENCE_INVALIDATED,
         ),
@@ -864,6 +934,14 @@ def split_family(task_set: TaskSet, family_id: str, analysis: CorpusAnalysis) ->
         raise ValueError(f"family {family_id} holds one distinct instruction; nothing to split")
 
     held_out_ids = set(target.held_out_trace_ids)
+    # An edge belongs to a replacement only when both lineage groups it joins
+    # are still in it. Dropping them all instead left a reviewer unable to see
+    # why two lineages had been held together, which is the record the merge
+    # was supposed to leave behind.
+    groups_of = {
+        descriptor: {feature.lineage_group for feature in group}
+        for descriptor, group in groups.items()
+    }
     replacements = [
         TaskFamily(
             family_id=f"family-{fingerprint(descriptor)}",
@@ -889,6 +967,11 @@ def split_family(task_set: TaskSet, family_id: str, analysis: CorpusAnalysis) ->
             # parent's measurement would overstate it; there is no distance
             # function here to recompute one with.
             coherence=None,
+            duplicate_lineages=tuple(
+                edge
+                for edge in target.duplicate_lineages
+                if {edge.left, edge.right} <= groups_of[descriptor]
+            ),
             limitations=tuple(
                 limit for limit in target.limitations if not limit.startswith("widest pair")
             ),

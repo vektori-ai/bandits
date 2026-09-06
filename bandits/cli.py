@@ -463,14 +463,17 @@ def merge_families_command(
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Record a reviewer's decision that several families are the same task."""
+    store = _derived(project)
     task_set = _load_task_set(task_set_id, project)
     try:
-        corrected = merge_families(task_set, tuple(family_ids))
-    except ValueError as exc:
+        corrected = merge_families(
+            task_set, tuple(family_ids), load_analysis(task_set.analysis_id, store)
+        )
+    except (FileNotFoundError, ValueError) as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    envelope = save_task_set(corrected, _derived(project))
+    envelope = save_task_set(corrected, store)
     _report(corrected, envelope.artifact_id)
 
 

@@ -120,7 +120,7 @@ The fit/held-out split moves whole lineage groups, so a declared retry chain nev
 
 Before splitting, lineage groups are unioned by duplicate evidence: identical requests, and — where a backend can measure it — requests above a much stricter similarity than the one used for grouping. Sameness is measured on requests with their identifiers intact, never on the masked descriptors grouping compares, because under those `refund order 7741` and `refund order 8802` are one string.
 
-The joins are recorded on the family as auditable edges rather than applied silently. Without them, a verifier drafted from a fit trace can be measured against a held-out trace carrying the same answer, and held-out agreement reports memorisation as generalisation — which is the number the promotion gate treats as its central evidence.
+The joins are recorded on the family as auditable edges rather than applied silently, and survive a reviewer's correction: `merge-families` reads the analysis so it can find lineages the two families disagreed about, moves any that end up on both sides whole to one side, and says it did. Without them, a verifier drafted from a fit trace can be measured against a held-out trace carrying the same answer, and held-out agreement reports memorisation as generalisation — which is the number the promotion gate treats as its central evidence.
 
 ### What produced a grouping
 
