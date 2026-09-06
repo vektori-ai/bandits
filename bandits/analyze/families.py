@@ -90,8 +90,7 @@ def fingerprint(instruction: str) -> str:
 Distance = Callable[[str, str], float]
 """How far apart two normalized instructions are, in [0, 1].
 
-Takes the descriptors rather than their tokens so that a backend measuring
-meaning rather than overlap can implement it.
+The callable receives the normalized descriptors used as embedding-cache keys.
 """
 
 
