@@ -22,6 +22,8 @@ import urllib.request
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
+from pydantic import model_validator
+
 from bandits.analyze.families import normalize_instruction
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract
@@ -31,9 +33,8 @@ if TYPE_CHECKING:
 
 DEFAULT_MODEL = "accounts/fireworks/models/qwen3-embedding-8b"
 DEFAULT_SIMILARITY = 0.6
-"""Below jaccard's threshold on purpose: cosine over dense vectors is not sparse
-overlap, and the two numbers are not comparable. Chosen from the measured gap
-between within-family and cross-family pairs on a real corpus."""
+"""Cosine-similarity cutoff chosen from the measured gap between within-family
+and cross-family pairs on a real corpus."""
 
 _BATCH = 32
 
@@ -49,8 +50,25 @@ class EmbeddingCache(Contract):
     model: str
     vectors: dict[str, tuple[float, ...]]
 
-    def digest(self) -> str:
-        payload = json.dumps({"model": self.model, "keys": sorted(self.vectors)}, sort_keys=True)
+    @model_validator(mode="after")
+    def vectors_are_comparable(self) -> EmbeddingCache:
+        """Every cached vector must be finite, non-empty, and the same size."""
+        dimensions = {len(vector) for vector in self.vectors.values()}
+        if 0 in dimensions:
+            raise ValueError("embedding vectors must not be empty")
+        if len(dimensions) > 1:
+            raise ValueError("embedding vectors must all have the same dimension")
+        if any(not math.isfinite(value) for vector in self.vectors.values() for value in vector):
+            raise ValueError("embedding vectors must contain only finite numbers")
+        return self
+
+    def digest(self, corpus_id: str) -> str:
+        """Identify the corpus and exact vectors, not merely their descriptor keys."""
+        payload = json.dumps(
+            {"corpus_id": corpus_id, "model": self.model, "vectors": self.vectors},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -68,23 +86,45 @@ def fireworks_embedder(model: str, texts: Sequence[str]) -> list[list[float]]:
         data=json.dumps({"model": model, "input": list(texts)}).encode(),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
     )
+    payload: object = None
     try:
         with urllib.request.urlopen(request, timeout=120) as response:
             payload = json.load(response)
     except (urllib.error.URLError, TimeoutError) as exc:
         raise EmbeddingError(f"embedding request failed: {exc}") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise EmbeddingError("embedding response was not valid JSON") from exc
 
     try:
-        ordered = sorted(payload["data"], key=lambda item: item["index"])
-    except (KeyError, TypeError) as exc:
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise TypeError("response data is not a list")
+        data = payload["data"]
+        if any(not isinstance(item, dict) for item in data):
+            raise TypeError("response data contains a non-object item")
+        ordered = sorted(data, key=lambda item: item["index"])
+        indices = [item["index"] for item in ordered]
+        if indices != list(range(len(texts))):
+            raise ValueError("embedding indexes are missing, duplicated, or out of range")
+        vectors = [item["embedding"] for item in ordered]
+        if any(not isinstance(vector, list) or not vector for vector in vectors):
+            raise TypeError("an embedding is not a non-empty list")
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            for vector in vectors
+            for value in vector
+        ):
+            raise TypeError("an embedding contains a non-numeric value")
+        if len({len(vector) for vector in vectors}) > 1:
+            raise ValueError("embedding dimensions are inconsistent")
+        if any(not math.isfinite(value) for vector in vectors for value in vector):
+            raise ValueError("an embedding contains a non-finite value")
+    except (KeyError, TypeError, ValueError) as exc:
         # A 200 carrying an error body — a quota message, a changed schema —
         # is still a failure, and must surface as one rather than a traceback.
         # Only the shape and any stated reason: the body may carry partial
         # vectors, and pasting those into an error makes it unreadable.
         raise EmbeddingError(f"embedding response was not usable: {_describe(payload)}") from exc
-    if len(ordered) != len(texts):
-        raise EmbeddingError(f"asked for {len(texts)} vectors, received {len(ordered)}")
-    return [item["embedding"] for item in ordered]
+    return vectors
 
 
 def _describe(payload: object) -> str:
@@ -151,13 +191,13 @@ def embedding_distance(cache: EmbeddingCache) -> Callable[[str, str], float]:
     return distance
 
 
-def compute_cache_id(cache: EmbeddingCache) -> str:
-    return f"embeddings-{cache.digest()}"
+def compute_cache_id(cache: EmbeddingCache, corpus_id: str) -> str:
+    return f"embeddings-{cache.digest(corpus_id)}"
 
 
 def save_cache(cache: EmbeddingCache, store: DerivedStore, corpus_id: str) -> DerivedEnvelope:
     return store.write(
-        compute_cache_id(cache),
+        compute_cache_id(cache, corpus_id),
         kind="embeddings",
         parent_artifact_id=corpus_id,
         payload=cache.model_dump_json().encode(),

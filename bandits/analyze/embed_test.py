@@ -1,9 +1,7 @@
 """Embedding backend tests. No network: the embedder callable is injected.
 
-The paraphrase cases here are the ones lexical overlap gets wrong, so each is
-asserted against ``jaccard_distance`` as well. A test that only showed the
-embedding path working would not show that it works *better*, which is the whole
-reason the backend exists.
+The paraphrase cases here pin the semantic geometry expected from the embedding
+backend without retaining a second production clustering implementation.
 """
 
 from __future__ import annotations
@@ -26,8 +24,7 @@ from bandits.analyze.embed import (
     load_cache,
     save_cache,
 )
-from bandits.analyze.families import DEFAULT_SIMILARITY as FAMILIES_SIMILARITY
-from bandits.analyze.families import jaccard_distance, mine_task_set, normalize_instruction
+from bandits.analyze.families import mine_task_set, normalize_instruction
 from bandits.analyze.models import CorpusAnalysis, TaskCandidate
 from bandits.store import DerivedStore
 
@@ -88,26 +85,19 @@ def test_paraphrases_land_in_one_family_where_lexical_grouping_cannot() -> None:
     analysis = _analysis(*LOGIN, *REVIEW)
     cache = _cache(*LOGIN, *REVIEW)
 
-    lexical = mine_task_set(analysis, "analysis-x", budget=10)
     embedded = _mine(analysis, cache, similarity=EMBEDDING_SIMILARITY)
 
-    assert len(lexical.families) == 4, "the lexical baseline should fragment these"
     assert len(embedded.families) == 2
     grouped = sorted(sorted(f.trace_ids) for f in embedded.families)
     assert grouped == [["trace-0", "trace-1"], ["trace-2", "trace-3"]]
 
 
-def test_the_lexical_threshold_rejects_pairs_the_backend_identifies() -> None:
-    """The integration hazard, end to end.
-
-    Passing a distance backend without also moving the threshold leaves grouping
-    at ``families.DEFAULT_SIMILARITY``, which demands a closeness real paraphrase
-    pairs do not reach. The backend then looks worse than it is.
-    """
+def test_an_overly_strict_threshold_rejects_pairs_the_backend_identifies() -> None:
+    """The embedding cutoff is calibrated and materially affects grouping."""
     analysis = _analysis(*LOGIN, *REVIEW)
     cache = _cache(*LOGIN, *REVIEW)
 
-    assert len(_mine(analysis, cache, similarity=FAMILIES_SIMILARITY).families) == 4
+    assert len(_mine(analysis, cache, similarity=0.7).families) == 4
     assert len(_mine(analysis, cache, similarity=EMBEDDING_SIMILARITY).families) == 2
 
 
@@ -118,13 +108,8 @@ def test_embedding_grouping_is_recorded_as_model_proposed() -> None:
     assert {f.proposed_by for f in task_set.families} == {"model"}
 
 
-def test_the_jaccard_threshold_would_reject_a_real_paraphrase_pair() -> None:
-    """Why the embedding path cannot inherit ``families.DEFAULT_SIMILARITY``.
-
-    0.7 demands a cosine distance of 0.3 or less. Same-family pairs measured on a
-    real corpus reach only 0.62 similarity, so the lexical default rejects pairs
-    the backend correctly identifies.
-    """
+def test_an_overly_strict_cosine_threshold_rejects_a_real_paraphrase_pair() -> None:
+    """0.7 rejects a measured same-family pair that reaches 0.62 similarity."""
     cache = _cache(*LOGIN)
     distance = embedding_distance(cache)
     pair = distance(*(normalize_instruction(text) for text in LOGIN))
@@ -179,16 +164,28 @@ def test_a_saved_cache_round_trips(tmp_path) -> None:
 
     envelope = save_cache(cache, store, "corpus-test")
 
-    assert envelope.artifact_id == compute_cache_id(cache)
+    assert envelope.artifact_id == compute_cache_id(cache, "corpus-test")
     assert envelope.parent_artifact_id == "corpus-test"
     assert load_cache(envelope.artifact_id, store) == cache
 
 
-def test_jaccard_scores_these_paraphrases_as_unrelated() -> None:
-    """The baseline this backend exists to replace."""
-    left, right = (normalize_instruction(text) for text in LOGIN)
+def test_identical_descriptors_in_two_corpora_get_separate_cache_artifacts(tmp_path) -> None:
+    store = DerivedStore(tmp_path)
+    cache = _cache(*LOGIN)
 
-    assert jaccard_distance(left, right) > 0.7
+    first = save_cache(cache, store, "corpus-a")
+    second = save_cache(cache, store, "corpus-b")
+
+    assert first.artifact_id != second.artifact_id
+    assert first.parent_artifact_id == "corpus-a"
+    assert second.parent_artifact_id == "corpus-b"
+
+
+def test_cache_identity_includes_vector_contents() -> None:
+    first = EmbeddingCache(model="stub", vectors={"task": (1.0, 0.0)})
+    second = EmbeddingCache(model="stub", vectors={"task": (0.0, 1.0)})
+
+    assert compute_cache_id(first, "corpus-test") != compute_cache_id(second, "corpus-test")
 
 
 def test_a_success_response_with_an_error_body_is_still_a_failure() -> None:
@@ -238,3 +235,40 @@ def test_an_unusable_response_is_described_without_quoting_its_contents() -> Non
     assert "quota exceeded" in message, "the stated reason has to survive"
     assert "0.123" not in message, "the payload's contents must not"
     assert len(message) < 300
+
+
+@pytest.mark.parametrize(
+    ("body", "detail"),
+    [
+        (b"not-json", "not valid JSON"),
+        (b'{"data":[{"index":0}]}', "not usable"),
+        (b'{"data":[{"index":0,"embedding":"wrong"}]}', "not usable"),
+        (b'{"data":[{"index":1,"embedding":[1.0]}]}', "not usable"),
+        (b'{"data":[{"index":0,"embedding":[1.0,null]}]}', "not usable"),
+    ],
+)
+def test_every_malformed_success_response_becomes_an_embedding_error(body, detail) -> None:
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return body
+
+    with (
+        mock.patch("urllib.request.urlopen", return_value=_Response()),
+        mock.patch.dict(os.environ, {"FIREWORKS_API_KEY": "x"}),
+        pytest.raises(EmbeddingError, match=detail),
+    ):
+        build_cache(["alpha"], model="stub")
+
+
+def test_embedding_cache_refuses_incomparable_vectors() -> None:
+    with pytest.raises(ValueError, match="same dimension"):
+        EmbeddingCache(model="stub", vectors={"a": (1.0,), "b": (1.0, 2.0)})
+
+    with pytest.raises(ValueError, match="finite"):
+        EmbeddingCache(model="stub", vectors={"a": (float("nan"),)})
