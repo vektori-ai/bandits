@@ -7,6 +7,7 @@ import json
 import math
 import statistics
 from collections import Counter
+from dataclasses import dataclass
 from typing import Any
 
 from bandits.analyze.families import normalize_instruction
@@ -18,11 +19,16 @@ from bandits.export.eval import (
     prompt_rejection_reasons,
 )
 from bandits.export.models import (
+    CompositionReport,
+    DuplicateGroup,
     ExportBundle,
     ExportKind,
     ExportManifest,
+    LengthSummary,
     Partition,
+    PartitionComposition,
     RejectedTrace,
+    SamplingCaps,
     SFTExample,
     ToolCall,
     ToolFunction,
@@ -324,6 +330,136 @@ def _near_duplicate_signature(messages: tuple[TrainingMessage, ...]) -> str:
     return hashlib.sha256(json.dumps(normalized, sort_keys=True).encode()).hexdigest()
 
 
+_SELECTION_POLICY = (
+    "trace_id ascending within the partition; caps are charged in that order, "
+    "and only against a row that passed every other gate"
+)
+"""How rows are reached, which is what decides which ones a cap keeps.
+
+Not a quality ranking: until the gates run, every trace the partition offers is
+an equal candidate, so the only honest order is one that does not depend on how
+the task set happened to list them.
+"""
+
+
+@dataclass(frozen=True)
+class _RowFacts:
+    """What the composition report needs about one rebuilt transcript."""
+
+    trace_id: str
+    family_id: str
+    source: str
+    lineage: str
+    models: tuple[str, ...]
+    scaffolds: tuple[str, ...]
+    tool_calls: tuple[str, ...]
+    messages: int
+    characters: int
+
+
+def _row_characters(messages: tuple[TrainingMessage, ...]) -> int:
+    """Row size in the text it actually carries, and never in tokens.
+
+    A tokenizer is not configured anywhere in this pipeline, and converting
+    this with a rule of thumb would produce a number that reads as measured.
+    """
+    return sum(
+        len(message.content or "")
+        + sum(len(call.function.name) + len(call.function.arguments) for call in message.tool_calls)
+        for message in messages
+    )
+
+
+def _row_facts(trace: Trace, family_id: str, messages: tuple[TrainingMessage, ...]) -> _RowFacts:
+    policy = generating_policy(trace)
+    return _RowFacts(
+        trace_id=trace.trace_id,
+        family_id=family_id,
+        source=trace.source,
+        # A trace whose source declared no lineage is its own, exactly as
+        # grouping treats it. Pooling them under one key would read as a single
+        # enormous retry chain and let one cap remove almost the whole dataset.
+        lineage=trace.lineage_id or f"trace:{trace.trace_id}",
+        models=tuple(policy["models"]),
+        scaffolds=tuple(policy["scaffolds"]),
+        tool_calls=tuple(call.function.name for message in messages for call in message.tool_calls),
+        messages=len(messages),
+        characters=_row_characters(messages),
+    )
+
+
+def _summarize(values: list[int]) -> LengthSummary:
+    if not values:
+        return LengthSummary(rows=0)
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, math.ceil(0.9 * len(ordered)) - 1))
+    return LengthSummary(
+        rows=len(ordered),
+        minimum=ordered[0],
+        median=float(statistics.median(ordered)),
+        p90=float(ordered[index]),
+        maximum=ordered[-1],
+        total=sum(ordered),
+    )
+
+
+def _counted(values: Counter[str]) -> dict[str, int]:
+    """Sorted by weight, heaviest first, so the skew is the first thing read."""
+    return {key: count for key, count in sorted(values.items(), key=lambda kv: (-kv[1], kv[0]))}
+
+
+def _compose(facts: list[_RowFacts]) -> PartitionComposition:
+    lineages = Counter(item.lineage for item in facts)
+    return PartitionComposition(
+        rows=len(facts),
+        rows_by_family=_counted(Counter(item.family_id for item in facts)),
+        rows_by_source=_counted(Counter(item.source for item in facts)),
+        rows_by_model=_counted(Counter(model for item in facts for model in item.models)),
+        rows_by_scaffold=_counted(
+            Counter(scaffold for item in facts for scaffold in item.scaffolds)
+        ),
+        rows_by_tool=_counted(Counter(tool for item in facts for tool in set(item.tool_calls))),
+        tool_calls_by_tool=_counted(Counter(tool for item in facts for tool in item.tool_calls)),
+        lineages=len(lineages),
+        repeated_lineages=_counted(
+            Counter({key: count for key, count in lineages.items() if count > 1})
+        ),
+        messages_per_row=_summarize([item.messages for item in facts]),
+        characters_per_row=_summarize([item.characters for item in facts]),
+    )
+
+
+def _cap_reasons(
+    facts: _RowFacts,
+    caps: SamplingCaps,
+    per_family: Counter[str],
+    per_lineage: Counter[str],
+) -> list[str]:
+    """Which configured cap this row would exceed, named exactly.
+
+    Charged only against a row that already passed every other gate: a rejected
+    row that spent cap budget would silently cost a good one its place.
+    """
+    reasons: list[str] = []
+    if (
+        caps.max_rows_per_family is not None
+        and per_family[facts.family_id] >= caps.max_rows_per_family
+    ):
+        reasons.append(
+            f"family {facts.family_id} already contributes {caps.max_rows_per_family} row(s); "
+            "excluded by max_rows_per_family"
+        )
+    if (
+        caps.max_rows_per_lineage is not None
+        and per_lineage[facts.lineage] >= caps.max_rows_per_lineage
+    ):
+        reasons.append(
+            f"lineage {facts.lineage} already contributes {caps.max_rows_per_lineage} row(s); "
+            "excluded by max_rows_per_lineage"
+        )
+    return reasons
+
+
 def build_sft_export(
     corpus: TraceCorpus,
     task_set: TaskSet,
@@ -334,12 +470,19 @@ def build_sft_export(
     *,
     partition: Partition = Partition.FIT,
     max_median_multiplier: float = 1.5,
+    caps: SamplingCaps | None = None,
 ) -> ExportBundle:
     """Export demonstrations from the side of the split evaluation may not use.
 
     The success threshold is not a parameter here. It was frozen when the
     verifier was accepted, and a caller re-choosing it could admit as a
     demonstration a run the validation it cites recorded as a failure.
+
+    Every gate below decides about one trace at a time, so none of them can see
+    that most of what passed came from one lineage, one source or one tool. The
+    bundle therefore carries a :class:`CompositionReport` describing both the
+    partition offered and the rows selected, and ``caps`` — unset by default —
+    is how a caller acts on what that report shows.
     """
     success_threshold = reviewed.success_threshold
     if max_median_multiplier < 1:
@@ -361,14 +504,27 @@ def build_sft_export(
     for item in analysis.evidence:
         evidence_by_trace.setdefault(item.trace_id, []).append(item)
 
+    limits = caps or SamplingCaps()
     rows: list[SFTExample] = []
     rejected: list[RejectedTrace] = []
     seen: set[str] = set()
-    for trace_id in eligible:
+    signatures: dict[str, list[str]] = {}
+    offered_facts: list[_RowFacts] = []
+    selected_facts: list[_RowFacts] = []
+    rows_per_family: Counter[str] = Counter()
+    rows_per_lineage: Counter[str] = Counter()
+    warning_reasons: Counter[str] = Counter()
+    unresolved_reasons: Counter[str] = Counter()
+
+    # Sorted rather than taken as listed: a cap keeps whichever rows it reaches
+    # first, so the order has to be a property of the traces themselves and not
+    # of how the task set happened to record them.
+    for trace_id in sorted(eligible):
         warnings: tuple[str, ...] = ()
         reasons = prompt_rejection_reasons(trace_id, analysis)
         trace = traces.get(trace_id)
         messages: tuple[TrainingMessage, ...] = ()
+        facts: _RowFacts | None = None
         if trace is None:
             reasons.append("corpus contains no matching trace")
         else:
@@ -380,21 +536,48 @@ def build_sft_export(
             messages, defects, warnings = build_transcript(trace)
             reasons.extend(defects)
             reasons.extend(_quality_reasons(trace, messages, max_steps))
+            facts = _row_facts(trace, family.family_id, messages)
+            # Measured before any gate runs: what the partition offered is the
+            # comparison that makes the selected dataset's skew readable.
+            offered_facts.append(facts)
             signature = _near_duplicate_signature(messages)
+            signatures.setdefault(signature, []).append(trace_id)
             if signature in seen:
                 reasons.append("near-duplicate training trajectory")
+            if limits.max_messages_per_row is not None and (
+                facts.messages > limits.max_messages_per_row
+            ):
+                reasons.append(
+                    f"transcript holds {facts.messages} message(s); excluded by "
+                    f"max_messages_per_row of {limits.max_messages_per_row}"
+                )
+            if limits.max_characters_per_row is not None and (
+                facts.characters > limits.max_characters_per_row
+            ):
+                reasons.append(
+                    f"transcript holds {facts.characters} character(s); excluded by "
+                    f"max_characters_per_row of {limits.max_characters_per_row}"
+                )
+            if not reasons:
+                reasons.extend(_cap_reasons(facts, limits, rows_per_family, rows_per_lineage))
             if not reasons:
                 seen.add(signature)
+                rows_per_family[facts.family_id] += 1
+                rows_per_lineage[facts.lineage] += 1
+                selected_facts.append(facts)
 
         if reasons:
+            deduplicated = tuple(dict.fromkeys(reasons))
+            unresolved_reasons.update(deduplicated)
             rejected.append(
                 RejectedTrace(
                     trace_id=trace_id,
                     family_id=family.family_id,
-                    reasons=tuple(dict.fromkeys(reasons)),
+                    reasons=deduplicated,
                 )
             )
             continue
+        warning_reasons.update(warnings)
 
         digest = hashlib.sha256(f"{trace_id}\0{spec.verifier_id}".encode()).hexdigest()[:16]
         rows.append(
@@ -417,6 +600,21 @@ def build_sft_export(
             )
         )
 
+    composition = CompositionReport(
+        offered_traces=len(eligible),
+        offered=_compose(offered_facts),
+        selected=_compose(selected_facts),
+        unresolved_reasons=_counted(unresolved_reasons),
+        warning_reasons=_counted(warning_reasons),
+        duplicate_groups=tuple(
+            DuplicateGroup(signature=signature, trace_ids=tuple(members))
+            for signature, members in sorted(
+                signatures.items(), key=lambda item: (-len(item[1]), item[0])
+            )
+            if len(members) > 1
+        ),
+    )
+
     return ExportBundle(
         manifest=ExportManifest(
             format=ExportKind.SFT,
@@ -432,10 +630,14 @@ def build_sft_export(
             partition_trace_count=len(eligible),
             success_threshold=success_threshold,
             max_median_multiplier=max_median_multiplier,
+            caps=limits if limits.configured else None,
+            selection_policy=_SELECTION_POLICY,
+            composition_schema_version=composition.schema_version,
             rows=len(rows),
             unresolved=len(rejected),
             warnings=_partition_warnings(family, partition),
         ),
         rows=tuple(rows),
         unresolved=tuple(rejected),
+        composition=composition,
     )
