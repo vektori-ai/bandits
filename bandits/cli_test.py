@@ -111,7 +111,7 @@ def offline_embedder(monkeypatch):
 
     Grouping now embeds every descriptor, so without this the whole suite would
     need an API key. Vectors are derived from the descriptor's own tokens, which
-    gives the support fixture the same families lexical grouping found — these
+    gives the support fixture stable, expected families — these
     tests are about the command's plumbing, not about grouping quality.
     """
 
@@ -211,7 +211,7 @@ def test_mining_twice_reuses_the_saved_cache(tmp_path) -> None:
     assert store.list(kind="embeddings")[0].artifact_id == before
 
 
-def test_mine_fails_loudly_rather_than_grouping_lexically(tmp_path) -> None:
+def test_mine_fails_loudly_when_embedding_fails(tmp_path) -> None:
     """No silent fallback: a task set nobody knows to distrust is the bug itself."""
     runner.invoke(
         app, ["ingest", str(SUPPORT_FIXTURE), "--source", "otlp", "--project", str(tmp_path)]

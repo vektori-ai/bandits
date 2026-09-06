@@ -316,7 +316,7 @@ def mine(
     similarity: float = typer.Option(
         EMBEDDING_SIMILARITY,
         "--similarity",
-        help="Higher groups more conservatively. Tuned for cosine, not word overlap.",
+        help="Higher groups more conservatively. Tuned for cosine similarity.",
     ),
     neighbors: int = typer.Option(
         DEFAULT_NEIGHBORS, "--neighbors", help="Maximum mutual neighbors per descriptor."
@@ -337,9 +337,8 @@ def mine(
     try:
         cache, cache_id = _embedding_cache(analysis, store, embedding_model)
     except EmbeddingError as exc:
-        # Never fall back to lexical grouping. A run that quietly used word
-        # overlap is indistinguishable from one that grouped by meaning, and
-        # produces a task set nobody knows to distrust.
+        # Embedding failures must stop the run rather than produce a task set
+        # whose requested clustering operation never completed.
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 

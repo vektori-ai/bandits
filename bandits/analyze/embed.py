@@ -1,9 +1,7 @@
-"""Group instructions by meaning rather than by shared words.
+"""Group instructions by meaning with embeddings.
 
-Lexical overlap cannot see paraphrase. Measured on 61 real Claude Code sessions,
-it reported 45 of 46 families as singletons while the corpus plainly contained a
-"log into the dev box" family and a "review this PR" family. The same pairs it
-scored near zero embed at 0.62-0.90 cosine, against 0.41-0.49 across families.
+Measured on 61 real Claude Code sessions, related pairs embed at 0.62-0.90
+cosine, against 0.41-0.49 across families.
 
 Embedding is a model-derived judgement, so a grouping that used one is recorded
 as ``proposed_by="model"`` rather than ``"rule"``, and the vectors are cached

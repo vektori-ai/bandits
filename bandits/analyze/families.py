@@ -36,10 +36,10 @@ DEFAULT_HELD_OUT = 0.3
 DEFAULT_NEIGHBORS = 3
 """Maximum neighbors per descriptor in the mutual-kNN grouping graph.
 
-Chosen for lexical grouping and carried over to the embedding backend unmeasured.
-Raising it reduces fragmentation but widens the transitive components that
-:func:`_cluster` builds, so it cannot be tuned on its own — the two effects need
-choosing together against a labelled corpus."""
+This value has not yet been calibrated for the embedding backend. Raising it
+reduces fragmentation but widens the transitive components that :func:`_cluster`
+builds, so it cannot be tuned on its own — the two effects need choosing together
+against a labelled corpus."""
 
 DEFAULT_TAIL_RESERVE = 0.3
 

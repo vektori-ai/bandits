@@ -81,7 +81,7 @@ def _mine(analysis, cache, **overrides):
     )
 
 
-def test_paraphrases_land_in_one_family_where_lexical_grouping_cannot() -> None:
+def test_paraphrases_land_in_one_embedding_family() -> None:
     analysis = _analysis(*LOGIN, *REVIEW)
     cache = _cache(*LOGIN, *REVIEW)
 
@@ -115,7 +115,7 @@ def test_an_overly_strict_cosine_threshold_rejects_a_real_paraphrase_pair() -> N
     pair = distance(*(normalize_instruction(text) for text in LOGIN))
 
     assert pair <= 1.0 - 0.6, "should group under the embedding default"
-    assert pair > 1.0 - 0.7, "and be rejected under the lexical one"
+    assert pair > 1.0 - 0.7, "and be rejected by an overly strict cutoff"
 
 
 def test_descriptors_are_the_strings_clustering_compares() -> None:
