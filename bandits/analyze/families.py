@@ -729,7 +729,6 @@ def _repair_straddles(
     fit: set[str],
     held: set[str],
     merged: dict[str, str],
-    family_id: str,
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     """Move whole components off the boundary, leaving everything else where it is.
 
@@ -739,9 +738,11 @@ def _repair_straddles(
     only a component actually sitting on both sides is moved, and it is moved
     whole — which is the same rule :func:`_split_by_lineage` follows.
 
-    The larger side wins, so the fewest traces move; an even split is decided by
-    the same stable hash the original partition used, so the repair is
-    reproducible rather than dependent on which family was merged first.
+    The larger side wins, so the fewest traces move. An even split goes to fit,
+    which is what :func:`_split_by_lineage` does with a group too big for the
+    held-out target, and which fails in the less damaging direction: a family
+    with no fit side can draft no verifier at all, while one with no held-out
+    side can still draft and simply cannot validate.
     """
     grouped: dict[str, set[str]] = {}
     for feature in members:
@@ -754,9 +755,7 @@ def _repair_straddles(
         in_fit, in_held = traces & fit, traces & held
         if not in_fit or not in_held:
             continue
-        to_fit = len(in_fit) > len(in_held) or (
-            len(in_fit) == len(in_held) and _stable_fraction(family_id, key) < 0.5
-        )
+        to_fit = len(in_fit) >= len(in_held)
         target, other = (fit, held) if to_fit else (held, fit)
         target |= traces
         other -= traces
@@ -802,7 +801,6 @@ def merge_families(
         {t for f in merged_from for t in f.fit_trace_ids},
         {t for f in merged_from for t in f.held_out_trace_ids},
         _merge_lineages(edges),
-        survivor.family_id,
     )
 
     limitations = {limit for f in merged_from for limit in f.limitations}
@@ -811,6 +809,20 @@ def merge_families(
             f"{len(moved)} lineage group(s) sat on both sides of the merged split and were "
             "moved whole to one side; a verifier measured against the old partition should "
             "be revalidated"
+        )
+    # A side emptied by the repair is the honest answer for a family whose
+    # traces are all one request — there is genuinely nothing independent to
+    # measure against — but it stops the family dead, so it is said outright
+    # rather than left to be discovered as an export drawing no rows.
+    if not held and len(trace_ids) > 1:
+        limitations.add(
+            "no held-out side remains after the merge; every lineage in this family "
+            "repeats another, so a verifier drafted here cannot be validated against it"
+        )
+    if not fit and len(trace_ids) > 1:
+        limitations.add(
+            "no fit side remains after the merge; there is nothing left in this family "
+            "to draft a verifier from"
         )
 
     merged = TaskFamily(

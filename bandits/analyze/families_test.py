@@ -835,3 +835,60 @@ def test_splitting_keeps_the_duplicate_evidence_that_still_applies(task_set, ana
         }
         for edge in family.duplicate_lineages:
             assert {edge.left, edge.right} <= members
+
+
+def _all_one_request() -> tuple[TaskSet, CorpusAnalysis]:
+    """Two families whose every trace is the same request under a different session."""
+    analysis = _requests(
+        ("a1", "refund order 7741", "sess-a"),
+        ("a2", "refund order 7741", "sess-b"),
+        ("b1", "refund order 7741", "sess-c"),
+        ("b2", "refund order 7741", "sess-d"),
+    )
+    left = TaskFamily(
+        family_id="fam-a",
+        descriptor="refund order <order_id>",
+        trace_ids=("a1", "a2"),
+        medoid_trace_id="a1",
+        workload_mass=2,
+        fit_trace_ids=("a1",),
+        held_out_trace_ids=("a2",),
+    )
+    right = TaskFamily(
+        family_id="fam-b",
+        descriptor="refund the order <order_id>",
+        trace_ids=("b1", "b2"),
+        medoid_trace_id="b1",
+        workload_mass=2,
+        fit_trace_ids=("b1",),
+        held_out_trace_ids=("b2",),
+    )
+    task_set = TaskSet(
+        corpus_id="corpus-duplicates",
+        analysis_id="analysis-duplicates",
+        families=(left, right),
+        selected=(),
+        total_workload_mass=4,
+        workload_coverage=1.0,
+        clustering=ClusteringProvenance(backend="exact", similarity=0.9, neighbors=3),
+    )
+    return task_set, analysis
+
+
+def test_a_merge_that_empties_a_side_says_so_rather_than_stopping_the_family_quietly() -> None:
+    """Every trace is one request, so there is genuinely nothing to hold out."""
+    task_set, analysis = _all_one_request()
+
+    family = merge_families(task_set, ("fam-a", "fam-b"), analysis).families[0]
+
+    assert not family.held_out_trace_ids
+    assert any("no held-out side remains" in limit for limit in family.limitations)
+
+
+def test_a_repair_never_takes_the_fit_side_away_on_a_tie() -> None:
+    """A family with no fit side can draft nothing at all; one with no held-out can still draft."""
+    task_set, analysis = _all_one_request()
+
+    family = merge_families(task_set, ("fam-a", "fam-b"), analysis).families[0]
+
+    assert set(family.fit_trace_ids) == {"a1", "a2", "b1", "b2"}
