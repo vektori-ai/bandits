@@ -26,7 +26,14 @@ from bandits.analyze import (
     split_family,
 )
 from bandits.analyze.families import DEFAULT_NEIGHBORS, _cluster, _medoid, _TraceFeatures
-from bandits.analyze.models import ClusteringProvenance, TaskFamily, TaskSet
+from bandits.analyze.models import (
+    ClusteringProvenance,
+    CorpusAnalysis,
+    DuplicateEdge,
+    TaskCandidate,
+    TaskFamily,
+    TaskSet,
+)
 from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
 
@@ -500,3 +507,178 @@ def test_a_task_set_mined_before_provenance_was_recorded_reads_back_as_unknown(t
     )
 
     assert older.clustering is None
+
+
+def _requests(*pairs: tuple[str, str, str | None]) -> CorpusAnalysis:
+    """An analysis of nothing but instructions, which is all grouping reads."""
+    return CorpusAnalysis(
+        corpus_id="corpus-duplicates",
+        source="otlp",
+        tasks=tuple(
+            TaskCandidate(
+                task_id=f"task-{trace_id}",
+                trace_id=trace_id,
+                lineage_id=lineage_id,
+                instruction=instruction,
+            )
+            for trace_id, instruction, lineage_id in pairs
+        ),
+        evidence=(),
+    )
+
+
+def _identical(left: str, right: str) -> float:
+    return 0.0 if left == right else 1.0
+
+
+def _mined(analysis: CorpusAnalysis, **overrides) -> TaskSet:
+    arguments = {"distance": _identical, "backend": "exact", "similarity": 0.9}
+    return mine_task_set(analysis, "analysis-duplicates", **{**arguments, **overrides})
+
+
+def test_the_same_request_from_two_sessions_never_straddles_the_split() -> None:
+    """The defect: a verifier drafted on one, then measured against the other."""
+    analysis = _requests(
+        ("monday", "refund order 7741", "sess-a"),
+        ("tuesday", "refund order 7741", "sess-b"),
+        ("other-1", "refund order 9002", "sess-c"),
+        ("other-2", "refund order 9100", "sess-d"),
+    )
+
+    family = _mined(analysis).families[0]
+
+    sides = (set(family.fit_trace_ids), set(family.held_out_trace_ids))
+    assert any({"monday", "tuesday"} <= side for side in sides)
+
+
+def test_a_source_declaring_no_lineage_at_all_still_holds_duplicates_together() -> None:
+    """The degenerate case: every trace its own group, so nothing was ever merged."""
+    analysis = _requests(*[(f"t{index}", "refund order 7741", None) for index in range(6)])
+
+    family = _mined(analysis).families[0]
+
+    assert not family.held_out_trace_ids
+    assert len(family.fit_trace_ids) == 6
+    assert any("repeats another request" in limit for limit in family.limitations)
+
+
+def test_different_requests_in_one_family_still_split() -> None:
+    """Grouping masks identifiers; sameness must not, or nothing is ever held out."""
+    analysis = _requests(
+        *[(f"t{index}", f"refund order {7741 + index}", None) for index in range(6)]
+    )
+
+    family = _mined(analysis, distance=lambda left, right: 0.0).families[0]
+
+    assert family.fit_trace_ids and family.held_out_trace_ids
+    assert family.duplicate_lineages == ()
+
+
+def test_an_exact_duplicate_is_recorded_as_evidence_rather_than_merged_silently() -> None:
+    analysis = _requests(
+        ("monday", "Refund order 7741.", "sess-a"),
+        ("tuesday", "refund  order 7741", "sess-b"),
+        ("other-1", "refund order 9002", "sess-c"),
+        ("other-2", "refund order 9100", "sess-d"),
+    )
+
+    family = _mined(analysis).families[0]
+
+    edge = next(item for item in family.duplicate_lineages)
+    assert (edge.left, edge.right) == ("sess-a", "sess-b")
+    assert edge.trace_ids == ("monday", "tuesday")
+    assert edge.basis == "identical_descriptor"
+    assert edge.similarity == 1.0
+
+
+def test_a_paraphrase_is_held_together_when_a_backend_can_measure_sameness() -> None:
+    """The half that needs embeddings: same request, different words."""
+    paraphrase = "please issue a refund for order 7741"
+    analysis = _requests(
+        ("monday", "refund order 7741", "sess-a"),
+        ("tuesday", paraphrase, "sess-b"),
+        ("other-1", "refund order 9002", "sess-c"),
+        ("other-2", "refund order 9100", "sess-d"),
+    )
+
+    def near(left: str, right: str) -> float:
+        pair = {left, right}
+        return 0.02 if pair == {"refund order 7741", paraphrase} else 1.0
+
+    # Grouping puts all four in one family; only sameness separates them.
+    family = _mined(
+        analysis,
+        distance=lambda left, right: 0.0,
+        duplicate_distance=near,
+        duplicate_similarity=0.95,
+    ).families[0]
+
+    edge = next(item for item in family.duplicate_lineages)
+    assert edge.basis == "near_identical_descriptor"
+    assert edge.similarity == pytest.approx(0.98)
+    sides = (set(family.fit_trace_ids), set(family.held_out_trace_ids))
+    assert any({"monday", "tuesday"} <= side for side in sides)
+
+
+def test_duplicate_evidence_is_transitive() -> None:
+    """A joined to B and B to C is one group, not two overlapping pairs."""
+    analysis = _requests(
+        ("a", "refund order 7741", "sess-a"),
+        ("b", "refund order 7741", "sess-b"),
+        ("c", "refund order 7741", "sess-c"),
+        ("d", "refund order 9002", "sess-d"),
+        ("e", "refund order 9100", "sess-e"),
+        ("f", "refund order 9200", "sess-f"),
+    )
+
+    family = _mined(analysis).families[0]
+
+    sides = (set(family.fit_trace_ids), set(family.held_out_trace_ids))
+    assert any({"a", "b", "c"} <= side for side in sides)
+
+
+def test_without_a_sameness_backend_only_identical_requests_are_held_together() -> None:
+    """The recorded threshold is what ran, not what was asked for."""
+    analysis = _requests(
+        ("monday", "refund order 7741", "sess-a"),
+        ("tuesday", "refund order 7741", "sess-b"),
+    )
+
+    task_set = _mined(analysis, duplicate_similarity=0.95)
+
+    assert task_set.clustering.duplicate_similarity == 1.0
+    assert task_set.families[0].duplicate_lineages
+
+
+def test_a_duplicate_threshold_looser_than_the_grouping_one_is_refused() -> None:
+    """Under it every member of a family is a retry of every other."""
+    with pytest.raises(ValidationError, match="at least as strict"):
+        ClusteringProvenance(
+            backend="embedding", similarity=0.6, neighbors=3, duplicate_similarity=0.5
+        )
+
+
+def test_a_duplicate_edge_records_its_groups_in_one_order() -> None:
+    with pytest.raises(ValidationError, match="sorted order"):
+        DuplicateEdge(
+            left="sess-b",
+            right="sess-a",
+            trace_ids=("t1", "t2"),
+            basis="identical_descriptor",
+            similarity=1.0,
+        )
+
+
+def test_a_declared_retry_chain_is_still_moved_whole() -> None:
+    """The behavior that already worked, and must survive the merge step."""
+    analysis = _requests(
+        ("retry-1", "refund order 7741", "sess-a"),
+        ("retry-2", "refund order 7742", "sess-a"),
+        ("other-1", "refund order 9002", "sess-b"),
+        ("other-2", "refund order 9100", "sess-c"),
+    )
+
+    family = _mined(analysis).families[0]
+
+    sides = (set(family.fit_trace_ids), set(family.held_out_trace_ids))
+    assert any({"retry-1", "retry-2"} <= side for side in sides)
