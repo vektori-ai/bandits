@@ -245,6 +245,18 @@ def interpret_reply(
                 raise InterpretationFailure(
                     "invalid_operator", f"unknown operator {raw_operator!r}", response
                 ) from exc
+        if revised_expected is None and revised_operator is None:
+            # A revision that changes nothing is not a revision. Applied, it
+            # would keep the check's content-addressed id while clearing the
+            # evidence chosen for it and marking it human-authored — the same id
+            # then denoting a check with strictly less behind it than before.
+            # The reviewer meant something; the model failed to capture it,
+            # which is what falling back to a decision they enter directly is for.
+            raise InterpretationFailure(
+                "unparseable",
+                "the model read a revision but named nothing to revise",
+                response,
+            )
 
     combine_with = None
     dropped = None
