@@ -23,7 +23,7 @@ from bandits.export import (
     save_export,
     write_jsonl,
 )
-from bandits.export.sft import _quality_reasons
+from bandits.export.sft import _quality_reasons, generating_policy
 from bandits.ingest.chat_json import load_chat_json
 from bandits.ingest.claude_code import load_claude_code
 from bandits.ingest.otlp import load_otlp
@@ -1204,3 +1204,71 @@ def test_an_eval_export_carries_no_composition_report(export_case) -> None:
     bundle = build_eval_export(corpus, task_set, task_set_id, analysis, reviewed, "reviewed-1")
 
     assert bundle.composition is None
+
+
+def test_a_declared_model_beats_a_span_name_that_is_really_a_tool(tmp_path) -> None:
+    """A chat tool call is a MODEL span named after the tool, not after the model."""
+    trace = _chat_trace(
+        tmp_path,
+        "declared",
+        json.dumps(
+            [
+                {
+                    "session_id": "s-1",
+                    "model": "gpt-5",
+                    "scaffold": "agent-v2",
+                    "messages": json.loads(_PAIRED_CONVERSATION),
+                }
+            ]
+        ),
+        "good-1",
+    )
+
+    policy = generating_policy(trace)
+
+    assert trace.runtime_context["model"] == "gpt-5"
+    assert policy["models"] == ("gpt-5",)
+    assert policy["scaffolds"] == ("agent-v2",)
+    assert "change_order" not in policy["models"]
+
+
+def test_with_nothing_declared_a_call_carrier_is_not_read_as_the_model(tmp_path) -> None:
+    """A bare message array has nowhere to declare a policy, and must not invent one."""
+    trace = _chat_trace(tmp_path, "bare", _PAIRED_CONVERSATION, "good-1")
+
+    policy = generating_policy(trace)
+
+    assert trace.runtime_context == {}
+    assert "change_order" not in policy["models"]
+    assert policy["models"] == ("assistant",)
+
+
+def test_an_otlp_trace_still_reports_the_model_its_spans_name() -> None:
+    """The fallback is unchanged where span names really are model names."""
+    assert generating_policy(_trace("good-1", 100, "changed"))["models"] == ("model-v1",)
+
+
+def test_the_composition_report_counts_the_declared_model_not_the_tool(tmp_path) -> None:
+    trace = _chat_trace(
+        tmp_path,
+        "composed",
+        json.dumps(
+            [
+                {
+                    "session_id": "s-1",
+                    "model": "gpt-5",
+                    "scaffold": "agent-v2",
+                    "messages": json.loads(_PAIRED_CONVERSATION),
+                }
+            ]
+        ),
+        "good-1",
+    )
+    corpus, analysis, task_set, task_set_id, _, _, reviewed = _export_with(trace)
+
+    bundle = build_sft_export(corpus, task_set, task_set_id, analysis, reviewed, "reviewed-1")
+
+    assert bundle.composition.selected.rows_by_model == {"gpt-5": 1}
+    assert bundle.composition.selected.rows_by_scaffold == {"agent-v2": 1}
+    row = next(item for item in bundle.rows if item.trace_id == "good-1")
+    assert tuple(row.generating_policy["models"]) == ("gpt-5",)

@@ -250,14 +250,69 @@ def build_transcript(
     return tuple(messages), tuple(dict.fromkeys(defects)), tuple(dict.fromkeys(warnings))
 
 
+_DECLARED_MODEL_KEYS = ("model", "gen_ai.request.model")
+"""Where each adapter records the model the run was configured with."""
+
+_DECLARED_SCAFFOLD_KEYS = ("scaffold", "agent_version", "framework", "version")
+"""Where each adapter records the harness around the model."""
+
+
+def _carrier_span_ids(trace: Trace) -> set[str]:
+    """Model spans that stand for a tool call rather than for a completion.
+
+    The same rule :func:`build_transcript` uses. A source that records call
+    arguments on the model span names that span after the *tool*, so reading
+    every model span's name as a model reports ``refund`` as the thing that
+    generated the episode.
+    """
+    by_id = {span.span_id: span for span in trace.spans}
+    carriers: set[str] = set()
+    for span in trace.spans:
+        if span.kind is not SpanKind.TOOL or span.arguments:
+            continue
+        parent = by_id.get(span.parent_span_id or "")
+        if parent is not None and parent.kind is SpanKind.MODEL and parent.arguments:
+            carriers.add(parent.span_id)
+    return carriers
+
+
 def generating_policy(trace: Trace) -> dict[str, Any]:
-    models = tuple(dict.fromkeys(span.name for span in trace.spans if span.kind is SpanKind.MODEL))
+    """What produced this episode, preferring what the source declared outright.
+
+    A span name is an inference; ``runtime_context`` is the source saying so.
+    Where a wrapper declares ``model: gpt-5``, that is the answer, and reading
+    span names instead reported a tool name as the generating model and the
+    scaffold as unknown — on a row whose whole purpose is to record the policy a
+    demonstration came from.
+    """
+    declared_models = tuple(
+        dict.fromkeys(
+            str(trace.runtime_context[key])
+            for key in _DECLARED_MODEL_KEYS
+            if trace.runtime_context.get(key)
+        )
+    )
+    carriers = _carrier_span_ids(trace)
+    models = declared_models or tuple(
+        dict.fromkeys(
+            span.name
+            for span in trace.spans
+            if span.kind is SpanKind.MODEL and span.span_id not in carriers
+        )
+    )
     scaffolds = tuple(
         dict.fromkeys(
-            str(span.attributes[key])
-            for span in trace.spans
-            for key in ("scaffold", "agent_version", "framework")
-            if span.attributes.get(key)
+            [
+                str(trace.runtime_context[key])
+                for key in _DECLARED_SCAFFOLD_KEYS
+                if trace.runtime_context.get(key)
+            ]
+            + [
+                str(span.attributes[key])
+                for span in trace.spans
+                for key in ("scaffold", "agent_version", "framework")
+                if span.attributes.get(key)
+            ]
         )
     )
     return {"models": models, "scaffolds": scaffolds or ("unknown",)}
