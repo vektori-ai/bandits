@@ -25,8 +25,8 @@ from bandits.analyze import (
     save_task_set,
     split_family,
 )
-from bandits.analyze.families import _cluster, _medoid, _TraceFeatures
-from bandits.analyze.models import TaskFamily, TaskSet
+from bandits.analyze.families import DEFAULT_NEIGHBORS, _cluster, _medoid, _TraceFeatures
+from bandits.analyze.models import ClusteringProvenance, TaskFamily, TaskSet
 from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
 
@@ -48,7 +48,12 @@ def analysis():
 @pytest.fixture
 def task_set(analysis):
     return mine_task_set(
-        analysis, compute_analysis_id(analysis), distance=_test_distance, similarity=0.7, budget=10
+        analysis,
+        compute_analysis_id(analysis),
+        distance=_test_distance,
+        backend="first-word",
+        similarity=0.7,
+        budget=10,
     )
 
 
@@ -170,6 +175,7 @@ def test_the_split_is_reproducible(analysis) -> None:
         compute_analysis_id(analysis),
         budget=10,
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
     )
     second = mine_task_set(
@@ -177,6 +183,7 @@ def test_the_split_is_reproducible(analysis) -> None:
         compute_analysis_id(analysis),
         budget=10,
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
     )
 
@@ -191,6 +198,7 @@ def test_grouping_ignores_everything_a_live_request_would_not_know(analysis) -> 
         compute_analysis_id(analysis),
         budget=10,
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
     )
     refunds = set(_family(task_set, "refund").trace_ids)
@@ -240,6 +248,7 @@ def test_coverage_reports_what_a_small_budget_leaves_out(analysis) -> None:
         compute_analysis_id(analysis),
         budget=1,
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
     )
     full = mine_task_set(
@@ -247,6 +256,7 @@ def test_coverage_reports_what_a_small_budget_leaves_out(analysis) -> None:
         compute_analysis_id(analysis),
         budget=10,
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
     )
 
@@ -261,6 +271,7 @@ def test_a_budget_larger_than_the_corpus_is_reported_as_underfilled(analysis) ->
         compute_analysis_id(analysis),
         budget=40,
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
     )
 
@@ -274,6 +285,7 @@ def test_the_last_slot_is_never_taken_by_the_tail_reserve(analysis) -> None:
         compute_analysis_id(analysis),
         budget=1,
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
     )
 
@@ -289,6 +301,7 @@ def test_traces_without_an_instruction_count_against_coverage() -> None:
         compute_analysis_id(analysis),
         budget=5,
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
     )
 
@@ -394,3 +407,96 @@ def test_task_set_round_trips_through_the_derived_store(tmp_path, task_set: Task
     assert envelope.kind == "taskset"
     assert envelope.parent_artifact_id == task_set.analysis_id
     assert load_task_set(envelope.artifact_id, store) == task_set
+
+
+def test_a_mined_task_set_records_what_grouped_it(analysis) -> None:
+    """Two task sets from one analysis differ only by this, and could not say so."""
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=_test_distance,
+        backend="first-word",
+        similarity=0.7,
+        neighbors=2,
+        budget=10,
+    )
+
+    assert task_set.clustering == ClusteringProvenance(
+        backend="first-word", similarity=0.7, neighbors=2
+    )
+
+
+def test_an_omitted_threshold_records_the_default_that_actually_applied(analysis) -> None:
+    """Recording None would say 'unset' about a value that certainly ran."""
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=_test_distance,
+        backend="x",
+        similarity=0.7,
+    )
+
+    assert task_set.clustering.neighbors == DEFAULT_NEIGHBORS
+
+
+def test_two_thresholds_produce_task_sets_that_explain_their_difference(analysis) -> None:
+    analysis_id = compute_analysis_id(analysis)
+
+    loose = mine_task_set(
+        analysis, analysis_id, distance=_test_distance, backend="first-word", similarity=0.1
+    )
+    tight = mine_task_set(
+        analysis, analysis_id, distance=_test_distance, backend="first-word", similarity=0.99
+    )
+
+    assert compute_task_set_id(loose) != compute_task_set_id(tight)
+    assert loose.clustering.similarity != tight.clustering.similarity
+
+
+def test_a_correction_keeps_the_provenance_of_the_grouping_it_corrects(task_set, analysis) -> None:
+    """A reviewer's correction does not change what grouped the set in the first place."""
+    refunds, cancels = _family(task_set, "refund"), _family(task_set, "cancel")
+
+    merged = merge_families(task_set, (refunds.family_id, cancels.family_id))
+    restored = split_family(merged, refunds.family_id, analysis)
+
+    assert merged.clustering == task_set.clustering
+    assert restored.clustering == task_set.clustering
+
+
+def test_an_embedding_grouping_pins_the_vectors_it_compared(analysis) -> None:
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=_test_distance,
+        backend="embedding",
+        embedding_model="qwen3-embedding-8b",
+        embedding_cache_id="embeddings-abc123",
+        similarity=0.6,
+        proposed_by="model",
+    )
+
+    assert task_set.clustering.embedding_model == "qwen3-embedding-8b"
+    assert task_set.clustering.embedding_cache_id == "embeddings-abc123"
+
+
+def test_a_cache_id_without_its_model_is_refused() -> None:
+    """Vectors from two models are not comparable; the id alone does not say which."""
+    with pytest.raises(ValidationError, match="meaningless without the model"):
+        ClusteringProvenance(
+            backend="embedding", similarity=0.6, neighbors=3, embedding_cache_id="embeddings-abc"
+        )
+
+
+def test_a_grouping_must_name_its_backend() -> None:
+    with pytest.raises(ValidationError, match="name the backend"):
+        ClusteringProvenance(backend="  ", similarity=0.6, neighbors=3)
+
+
+def test_a_task_set_mined_before_provenance_was_recorded_reads_back_as_unknown(task_set) -> None:
+    """An older artifact says nothing rather than claiming a backend it never had."""
+    older = TaskSet.model_validate(
+        {k: v for k, v in task_set.model_dump().items() if k != "clustering"}
+    )
+
+    assert older.clustering is None
