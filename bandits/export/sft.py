@@ -260,20 +260,47 @@ _DECLARED_SCAFFOLD_KEYS = ("scaffold", "agent_version", "framework", "version")
 def _carrier_span_ids(trace: Trace) -> set[str]:
     """Model spans that stand for a tool call rather than for a completion.
 
-    The same rule :func:`build_transcript` uses. A source that records call
-    arguments on the model span names that span after the *tool*, so reading
-    every model span's name as a model reports ``refund`` as the thing that
-    generated the episode.
+    A source that records a call on the model span names that span after the
+    *tool*, so reading every model span's name as a model reports ``refund`` as
+    the thing that generated the episode.
+
+    Recognised three ways, because the argument-based rule
+    :func:`build_transcript` uses answers a different question — where the
+    arguments live — and a call that took no arguments has none to find. A
+    carrier is a model span an adapter marked as one, or that a tool span of the
+    same name hangs off, or that holds the arguments for an otherwise bare tool
+    span. A model span parenting a tool span of a *different* name is not a
+    carrier: that is the OTLP shape, where the parent really is the model.
     """
     by_id = {span.span_id: span for span in trace.spans}
     carriers: set[str] = set()
     for span in trace.spans:
-        if span.kind is not SpanKind.TOOL or span.arguments:
+        if span.kind is SpanKind.MODEL and span.attributes.get("tool_call"):
+            carriers.add(span.span_id)
+            continue
+        if span.kind is not SpanKind.TOOL:
             continue
         parent = by_id.get(span.parent_span_id or "")
-        if parent is not None and parent.kind is SpanKind.MODEL and parent.arguments:
+        if parent is None or parent.kind is not SpanKind.MODEL:
+            continue
+        if parent.name == span.name or (parent.arguments and not span.arguments):
             carriers.add(parent.span_id)
     return carriers
+
+
+def _declared(context: dict[str, Any], keys: tuple[str, ...]) -> list[str]:
+    """Values a source stated outright, keeping only ones that read as a name.
+
+    A structure under ``model`` is a shape this does not understand, and
+    ``str()``-ing it would put ``{'name': 'gpt-5'}`` in the field a reader takes
+    for a model. An empty or non-textual declaration is no declaration.
+    """
+    values: list[str] = []
+    for key in keys:
+        value = context.get(key)
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip())
+    return values
 
 
 def generating_policy(trace: Trace) -> dict[str, Any]:
@@ -285,13 +312,7 @@ def generating_policy(trace: Trace) -> dict[str, Any]:
     scaffold as unknown — on a row whose whole purpose is to record the policy a
     demonstration came from.
     """
-    declared_models = tuple(
-        dict.fromkeys(
-            str(trace.runtime_context[key])
-            for key in _DECLARED_MODEL_KEYS
-            if trace.runtime_context.get(key)
-        )
-    )
+    declared_models = tuple(dict.fromkeys(_declared(trace.runtime_context, _DECLARED_MODEL_KEYS)))
     carriers = _carrier_span_ids(trace)
     models = declared_models or tuple(
         dict.fromkeys(
@@ -302,11 +323,7 @@ def generating_policy(trace: Trace) -> dict[str, Any]:
     )
     scaffolds = tuple(
         dict.fromkeys(
-            [
-                str(trace.runtime_context[key])
-                for key in _DECLARED_SCAFFOLD_KEYS
-                if trace.runtime_context.get(key)
-            ]
+            _declared(trace.runtime_context, _DECLARED_SCAFFOLD_KEYS)
             + [
                 str(span.attributes[key])
                 for span in trace.spans

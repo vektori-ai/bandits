@@ -1272,3 +1272,71 @@ def test_the_composition_report_counts_the_declared_model_not_the_tool(tmp_path)
     assert bundle.composition.selected.rows_by_scaffold == {"agent-v2": 1}
     row = next(item for item in bundle.rows if item.trace_id == "good-1")
     assert tuple(row.generating_policy["models"]) == ("gpt-5",)
+
+
+def _chat_policy(tmp_path, name: str, wrapper: dict, arguments: str = "{}") -> dict:
+    path = tmp_path / f"{name}.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    **wrapper,
+                    "messages": [
+                        {"role": "user", "content": "Refund order 7741"},
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "c1",
+                                    "type": "function",
+                                    "function": {"name": "refund", "arguments": arguments},
+                                }
+                            ],
+                        },
+                        {"role": "tool", "tool_call_id": "c1", "name": "refund", "content": "{}"},
+                        {"role": "assistant", "content": "done"},
+                    ],
+                }
+            ]
+        )
+    )
+    return generating_policy(load_chat_json(path).traces[0])
+
+
+def test_a_call_taking_no_arguments_is_still_not_read_as_the_model(tmp_path) -> None:
+    """The argument-based carrier rule has nothing to find when a call took none."""
+    policy = _chat_policy(tmp_path, "zero_arg", {"session_id": "s"}, arguments="{}")
+
+    assert "refund" not in policy["models"]
+
+
+@pytest.mark.parametrize(
+    ("name", "declared"),
+    [("empty", ""), ("structured", {"name": "gpt-5"}), ("numeric", 0)],
+)
+def test_a_declaration_that_does_not_read_as_a_name_is_not_one(
+    tmp_path, name: str, declared: object
+) -> None:
+    """str()-ing a structure would put {'name': 'gpt-5'} where a reader expects a model."""
+    policy = _chat_policy(tmp_path, f"declared_{name}", {"session_id": "s", "model": declared})
+
+    assert policy["models"] == ("assistant",)
+    assert "refund" not in policy["models"]
+
+
+def test_a_claude_code_tool_call_span_is_not_read_as_the_model(tmp_path) -> None:
+    """That adapter marks its carriers outright; the marking is honoured."""
+    path = tmp_path / "session.jsonl"
+    path.write_text(
+        '{"type":"user","sessionId":"s","message":{"role":"user","content":"change order 100"}}\n'
+        '{"type":"assistant","sessionId":"s","message":{"role":"assistant","model":"claude-opus-5",'
+        '"content":[{"type":"tool_use","id":"tu-1","name":"change_order","input":{}}]}}\n'
+        '{"type":"user","sessionId":"s","message":{"role":"user","content":'
+        '[{"type":"tool_result","tool_use_id":"tu-1","content":"{}"}]}}\n'
+        '{"type":"assistant","sessionId":"s","message":{"role":"assistant",'
+        '"content":[{"type":"text","text":"done"}]}}\n'
+    )
+
+    policy = generating_policy(load_claude_code(path).traces[0])
+
+    assert "change_order" not in policy["models"]
